@@ -1,0 +1,265 @@
+#!/usr/bin/env bash
+# edge — CLI for rhizome-alkahest knowledge graph
+#
+# First, establish a reference frame:
+#   edge iam <who>
+#   edge true <subject> <predicate> <object>   (three times)
+#
+# Then record edges:
+#   edge add <subject> <predicate> <object> [--confidence N] [--phase P]
+#
+# Query:
+#   edge find <term>         search subject/object/observer
+#   edge about <subject>     edges from subject
+#   edge from <who>          the graph as seen by this person
+#   edge parallax            where observers disagree
+#   edge ls [phase]          list edges
+#   edge frames              list all reference frames
+#   edge whoami              current frame
+#   edge dissolve <s> <p> <o>
+#   edge count / raw <sql> / help
+
+DB="rhizome-alkahest"
+PSQL="/opt/homebrew/opt/postgresql@17/bin/psql"
+FRAME_FILE="$HOME/.edge_frame"
+
+cmd="${1:-ls}"
+shift 2>/dev/null
+
+_current_token() {
+    [[ -f "$FRAME_FILE" ]] && cat "$FRAME_FILE" || echo ""
+}
+
+_require_frame() {
+    local token
+    token="$(_current_token)"
+    if [[ -z "$token" ]]; then
+        echo "  no reference frame. run: edge iam <who>"
+        exit 1
+    fi
+    # Check truth count
+    local n
+    n="$($PSQL -At "$DB" -c "SELECT jsonb_array_length(truths) FROM frames WHERE token = '$token';" 2>/dev/null)"
+    if [[ "$n" -lt 3 ]]; then
+        echo "  frame incomplete ($n/3 truths). run: edge true <s> <p> <o>"
+        exit 1
+    fi
+    echo "$token"
+}
+
+case "$cmd" in
+    iam)
+        local_who="$1"
+        if [[ -z "$local_who" ]]; then
+            echo "usage: edge iam <who>"
+            exit 1
+        fi
+        local_cwd="$(pwd)"
+        local_short="$(echo "$local_who:$(date +%s)" | shasum | head -c 8)"
+        local_token="${local_who}:${local_short}"
+        $PSQL -q "$DB" -c "
+            INSERT INTO frames (token, who, cwd)
+            VALUES ('$local_token', '$local_who', '$local_cwd');
+        "
+        echo "$local_token" > "$FRAME_FILE"
+        echo "  I am $local_who. Frame: $local_token"
+        echo "  Establish your reference frame. Say three true things:"
+        echo "    edge true <subject> <predicate> <object>"
+        ;;
+    true)
+        local_token="$(_current_token)"
+        if [[ -z "$local_token" ]]; then
+            echo "  no frame started. run: edge iam <who>"
+            exit 1
+        fi
+        local_subject="$1"
+        local_predicate="$2"
+        local_object="$3"
+        if [[ -z "$local_subject" || -z "$local_predicate" || -z "$local_object" ]]; then
+            echo "usage: edge true <subject> <predicate> <object>"
+            exit 1
+        fi
+        local_truth="{\"s\": \"$local_subject\", \"p\": \"$local_predicate\", \"o\": \"$local_object\"}"
+        $PSQL -q "$DB" -c "
+            UPDATE frames
+            SET truths = truths || '$local_truth'::jsonb
+            WHERE token = '$local_token';
+        "
+        local_n="$($PSQL -At "$DB" -c "SELECT jsonb_array_length(truths) FROM frames WHERE token = '$local_token';")"
+        echo "  truth $local_n/3: ($local_subject --$local_predicate--> $local_object)"
+        if [[ "$local_n" -ge 3 ]]; then
+            echo "  Reference frame established. You can now record edges."
+        fi
+        ;;
+    add)
+        local_token="$(_require_frame)"
+        [[ $? -ne 0 ]] && exit 1
+        local_confidence="0.7"
+        local_phase="fluid"
+        local_note=""
+        local_positional=()
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --confidence) local_confidence="$2"; shift 2 ;;
+                --phase) local_phase="$2"; shift 2 ;;
+                --note) local_note="$2"; shift 2 ;;
+                *) local_positional+=("$1"); shift ;;
+            esac
+        done
+        local_subject="${local_positional[0]}"
+        local_predicate="${local_positional[1]}"
+        local_object="${local_positional[2]}"
+        if [[ -z "$local_subject" || -z "$local_predicate" || -z "$local_object" ]]; then
+            echo "usage: edge add <s> <p> <o> [--confidence N] [--phase P] [--note 'text']"
+            exit 1
+        fi
+        $PSQL -q "$DB" -c "
+            INSERT INTO edges (subject, predicate, object, confidence, phase, observer, notes)
+            VALUES ('$local_subject', '$local_predicate', '$local_object', $local_confidence, '$local_phase', '$local_token', '$(echo "$local_note" | sed "s/'/''/g")')
+            ON CONFLICT DO NOTHING;
+        "
+        local_who="$($PSQL -At "$DB" -c "SELECT who FROM frames WHERE token = '$local_token';")"
+        echo "  + ($local_subject --$local_predicate--> $local_object) [$local_confidence, $local_phase, @$local_who]"
+        [[ -n "$local_note" ]] && echo "    note: $local_note"
+        ;;
+    find)
+        local_term="$1"
+        if [[ -z "$local_term" ]]; then
+            echo "usage: edge find <term>"
+            exit 1
+        fi
+        $PSQL "$DB" -c "
+            SELECT e.subject, e.predicate, e.object, e.confidence, f.who
+            FROM live_edges e
+            JOIN frames f ON e.observer = f.token
+            WHERE e.subject ILIKE '%${local_term}%'
+               OR e.object ILIKE '%${local_term}%'
+               OR f.who ILIKE '%${local_term}%'
+            ORDER BY e.confidence DESC;
+        "
+        ;;
+    about)
+        local_subject="$1"
+        if [[ -z "$local_subject" ]]; then
+            echo "usage: edge about <subject>"
+            exit 1
+        fi
+        $PSQL "$DB" -c "
+            SELECT e.predicate, e.object, e.confidence, f.who
+            FROM live_edges e
+            JOIN frames f ON e.observer = f.token
+            WHERE e.subject = '$local_subject'
+            ORDER BY e.confidence DESC;
+        "
+        ;;
+    from)
+        local_who="$1"
+        if [[ -z "$local_who" ]]; then
+            echo "usage: edge from <who>"
+            exit 1
+        fi
+        $PSQL "$DB" -c "
+            SELECT e.subject, e.predicate, e.object, e.confidence, e.phase
+            FROM live_edges e
+            JOIN frames f ON e.observer = f.token
+            WHERE f.who = '$local_who'
+            ORDER BY e.updated_at DESC;
+        "
+        ;;
+    parallax)
+        $PSQL "$DB" -c "SELECT * FROM parallax ORDER BY spread DESC;"
+        ;;
+    frames)
+        $PSQL "$DB" -c "
+            SELECT f.token, f.who, f.cwd, f.created_at,
+                   (SELECT count(*) FROM live_edges e WHERE e.observer = f.token) as edges
+            FROM frames f
+            ORDER BY f.created_at DESC;
+        "
+        ;;
+    whoami)
+        local_token="$(_current_token)"
+        if [[ -z "$local_token" ]]; then
+            echo "  no frame. run: edge iam <who>"
+        else
+            $PSQL "$DB" -c "
+                SELECT token, who, cwd, truths, created_at
+                FROM frames WHERE token = '$local_token';
+            "
+        fi
+        ;;
+    ls)
+        local_phase="$1"
+        if [[ -n "$local_phase" ]]; then
+            $PSQL "$DB" -c "
+                SELECT e.subject, e.predicate, e.object, e.confidence, f.who
+                FROM live_edges e
+                JOIN frames f ON e.observer = f.token
+                WHERE e.phase = '$local_phase'
+                ORDER BY e.updated_at DESC;
+            "
+        else
+            $PSQL "$DB" -c "
+                SELECT e.subject, e.predicate, e.object, e.confidence, e.phase, f.who
+                FROM live_edges e
+                JOIN frames f ON e.observer = f.token
+                ORDER BY e.updated_at DESC;
+            "
+        fi
+        ;;
+    dissolve)
+        local_subject="$1"
+        local_predicate="$2"
+        local_object="$3"
+        if [[ -z "$local_subject" || -z "$local_predicate" || -z "$local_object" ]]; then
+            echo "usage: edge dissolve <subject> <predicate> <object>"
+            exit 1
+        fi
+        $PSQL -q "$DB" -c "
+            UPDATE edges SET dissolved_at = now()
+            WHERE subject = '$local_subject'
+              AND predicate = '$local_predicate'
+              AND object = '$local_object'
+              AND dissolved_at IS NULL;
+        "
+        echo "  dissolved: ($local_subject --$local_predicate--> $local_object)"
+        ;;
+    count)
+        $PSQL "$DB" -c "SELECT * FROM phase_summary;"
+        $PSQL "$DB" -c "
+            SELECT f.who, count(*) as n
+            FROM live_edges e
+            JOIN frames f ON e.observer = f.token
+            GROUP BY f.who ORDER BY n DESC;
+        "
+        $PSQL "$DB" -c "SELECT count(*) as total FROM live_edges;"
+        ;;
+    raw)
+        $PSQL "$DB" -c "$*"
+        ;;
+    help|-h|--help)
+        echo "Establish a reference frame:"
+        echo "  edge iam <who>                         start a frame"
+        echo "  edge true <s> <p> <o>                  say a true thing (need 3)"
+        echo "  edge whoami                            current frame"
+        echo ""
+        echo "Record:"
+        echo "  edge add <s> <p> <o> [--confidence N] [--phase P]"
+        echo ""
+        echo "Query:"
+        echo "  edge find <term>                       search everywhere"
+        echo "  edge about <subject>                   edges from subject"
+        echo "  edge from <who>                        the graph from a perspective"
+        echo "  edge parallax                          where observers disagree"
+        echo "  edge frames                            list all reference frames"
+        echo "  edge ls [phase]                        list edges"
+        echo "  edge dissolve <s> <p> <o>              soft-delete"
+        echo "  edge count                             summary"
+        echo "  edge raw <sql>                         escape hatch"
+        ;;
+    *)
+        echo "unknown command: $cmd"
+        echo "try: edge help"
+        exit 1
+        ;;
+esac
