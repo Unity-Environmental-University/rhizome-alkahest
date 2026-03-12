@@ -115,3 +115,19 @@ CREATE VIEW parallax AS
     JOIN frames f ON e.observer = f.token
     GROUP BY e.subject, e.predicate, e.object
     HAVING count(DISTINCT f.who) > 1;
+
+-- Parallax by token: treats every frame as a distinct observer.
+-- Claude across sessions is a population, not a person.
+-- The spread between claude-session-2 and claude-empathy is real data.
+CREATE VIEW parallax_token AS
+    SELECT e.subject, e.predicate, e.object,
+           count(DISTINCT e.observer) as observers,
+           min(e.confidence) as min_confidence,
+           max(e.confidence) as max_confidence,
+           max(e.confidence) - min(e.confidence) as spread,
+           array_agg(DISTINCT f.who) as who,
+           array_agg(DISTINCT e.observer) as tokens
+    FROM live_edges e
+    JOIN frames f ON e.observer = f.token
+    GROUP BY e.subject, e.predicate, e.object
+    HAVING count(DISTINCT e.observer) > 1;

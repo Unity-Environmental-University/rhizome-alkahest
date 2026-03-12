@@ -15,12 +15,9 @@ and [alkahest](https://github.com/Unity-Environmental-University/alkahest-py) ty
 # Requires PostgreSQL 17 + pgvector
 brew install postgresql@17 pgvector
 brew services start postgresql@17
-createdb rhizome-alkahest
-psql rhizome-alkahest < schema.sql
 
-# The edge CLI
-chmod +x edge
-ln -s $(pwd)/edge ~/utils/edge
+# Install: sets up the database, links the edge CLI, and installs the Claude skill
+./install.sh
 
 # Establish a reference frame
 edge iam you

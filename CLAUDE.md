@@ -78,3 +78,7 @@ The parallax between frames is data, not noise.
 ## Design principles
 
 Proceed as the way opens.
+
+## Skill
+
+A Claude skill for working with this graph lives at `.claude/skills/rhizome/skill.md`. It covers frames, composite identity (speaks-as/speaks-for), recording, querying, and graph reading.

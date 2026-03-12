@@ -49,9 +49,37 @@ _require_frame() {
 
 case "$cmd" in
     iam)
-        local_who="$1"
+        local_speaks_as_list=()
+        local_speaks_for_list=()
+        local_positional=()
+        local_in_for=false
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --for) local_in_for=true; shift ;;
+                --as)  local_in_for=false; shift ;;
+                *)
+                    if $local_in_for; then
+                        local_speaks_for_list+=("$1")
+                    else
+                        local_speaks_as_list+=("$1")
+                    fi
+                    shift ;;
+            esac
+        done
+        # Derive composite who from lists if no explicit name given
+        local_who=""
+        if [[ ${#local_speaks_as_list[@]} -gt 0 || ${#local_speaks_for_list[@]} -gt 0 ]]; then
+            local_as_part="$(IFS=+; echo "${local_speaks_as_list[*]}")"
+            local_for_part="$(IFS=+; echo "${local_speaks_for_list[*]}")"
+            if [[ -n "$local_as_part" && -n "$local_for_part" ]]; then
+                local_who="${local_as_part}-reading-${local_for_part}"
+            elif [[ -n "$local_as_part" ]]; then
+                local_who="$local_as_part"
+            fi
+        fi
         if [[ -z "$local_who" ]]; then
             echo "usage: edge iam <who>"
+            echo "       edge iam <self> [<self2> ...] --for <other> [<other2> ...]"
             exit 1
         fi
         local_cwd="$(pwd)"
@@ -65,6 +93,13 @@ case "$cmd" in
         echo "  I am $local_who. Frame: $local_token"
         echo "  Establish your reference frame. Say three true things:"
         echo "    edge true <subject> <predicate> <object>"
+        # Store composite lists for post-truth registration
+        if [[ ${#local_speaks_as_list[@]} -gt 0 || ${#local_speaks_for_list[@]} -gt 0 ]]; then
+            printf "%s\n" "as:${local_speaks_as_list[*]}" "for:${local_speaks_for_list[*]}" > "${FRAME_FILE}.composite"
+        else
+            rm -f "${FRAME_FILE}.composite"
+        fi
+        exit 0
         ;;
     true)
         local_token="$(_current_token)"
@@ -89,6 +124,30 @@ case "$cmd" in
         echo "  truth $local_n/3: ($local_subject --$local_predicate--> $local_object)"
         if [[ "$local_n" -ge 3 ]]; then
             echo "  Reference frame established. You can now record edges."
+            # Auto-register composite speaks-as/speaks-for if flagged
+            local_composite_file="${FRAME_FILE}.composite"
+            if [[ -f "$local_composite_file" ]]; then
+                local_frame_who="$($PSQL -At "$DB" -c "SELECT who FROM frames WHERE token = '$local_token';")"
+                local_as_line="$(grep '^as:' "$local_composite_file" | sed 's/^as://')"
+                local_for_line="$(grep '^for:' "$local_composite_file" | sed 's/^for://')"
+                for local_speaks_as in $local_as_line; do
+                    $PSQL -q "$DB" -c "
+                        INSERT INTO edges (subject, predicate, object, confidence, phase, observer, notes)
+                        VALUES ('$local_frame_who', 'speaks-as', '$local_speaks_as', 1.0, 'salt', '$local_token', 'auto-registered on frame creation')
+                        ON CONFLICT DO NOTHING;
+                    "
+                    echo "  + ($local_frame_who --speaks-as--> $local_speaks_as) [1.0, salt]"
+                done
+                for local_speaks_for in $local_for_line; do
+                    $PSQL -q "$DB" -c "
+                        INSERT INTO edges (subject, predicate, object, confidence, phase, observer, notes)
+                        VALUES ('$local_frame_who', 'speaks-for', '$local_speaks_for', 0.7, 'fluid', '$local_token', 'auto-registered on frame creation')
+                        ON CONFLICT DO NOTHING;
+                    "
+                    echo "  + ($local_frame_who --speaks-for--> $local_speaks_for) [0.7, fluid]"
+                done
+                rm -f "$local_composite_file"
+            fi
         fi
         ;;
     add)
@@ -121,6 +180,7 @@ case "$cmd" in
         local_who="$($PSQL -At "$DB" -c "SELECT who FROM frames WHERE token = '$local_token';")"
         echo "  + ($local_subject --$local_predicate--> $local_object) [$local_confidence, $local_phase, @$local_who]"
         [[ -n "$local_note" ]] && echo "    note: $local_note"
+        exit 0
         ;;
     find)
         local_term="$1"
@@ -168,6 +228,9 @@ case "$cmd" in
         ;;
     parallax)
         $PSQL "$DB" -c "SELECT * FROM parallax ORDER BY spread DESC;"
+        ;;
+    parallax-token)
+        $PSQL "$DB" -c "SELECT * FROM parallax_token ORDER BY spread DESC;"
         ;;
     frames)
         $PSQL "$DB" -c "
@@ -240,6 +303,7 @@ case "$cmd" in
     help|-h|--help)
         echo "Establish a reference frame:"
         echo "  edge iam <who>                         start a frame"
+        echo "  edge iam <s1> [<s2>...] --for <o1> [<o2>...]   composite frame (auto speaks-as/speaks-for)"
         echo "  edge true <s> <p> <o>                  say a true thing (need 3)"
         echo "  edge whoami                            current frame"
         echo ""
