@@ -293,6 +293,186 @@ def edge_count() -> str:
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# Thread tools — cross-Claude conversation threads
+# ---------------------------------------------------------------------------
+
+def _git_context() -> dict:
+    import subprocess
+    def _run(cmd):
+        try:
+            return subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode().strip()
+        except Exception:
+            return ""
+    return {
+        "cwd": os.getcwd(),
+        "repo": _run(["git", "remote", "get-url", "origin"]).split("/")[-1].removesuffix(".git"),
+        "branch": _run(["git", "branch", "--show-current"]),
+    }
+
+
+@mcp.tool()
+def thread_ls() -> str:
+    """List Claude-to-Claude conversation threads with read/unread status."""
+    frame = _load_frame()
+    if not frame or not frame.ready:
+        return "No active frame. Call edge_iam + edge_true (x3) first."
+
+    conn = connect()
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT DISTINCT e.object AS slug,
+                (SELECT notes FROM edges
+                 WHERE subject = e.object AND predicate = 'thread-title'
+                   AND dissolved_at IS NULL LIMIT 1) AS title,
+                MAX(e.created_at) AS last_message
+            FROM edges e
+            WHERE e.predicate = 'thread-wrote' AND e.dissolved_at IS NULL
+            GROUP BY e.object ORDER BY last_message DESC
+        """)
+        threads = cur.fetchall()
+
+    if not threads:
+        return "(no threads)"
+
+    lines = []
+    unread = 0
+    for slug, title, last_msg in threads:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT MAX(created_at) FROM edges
+                WHERE subject = %s AND predicate = 'thread-read'
+                  AND object = %s AND dissolved_at IS NULL
+            """, (frame.token, slug))
+            last_read = cur.fetchone()[0]
+
+        display = slug.removeprefix("thread:")
+        label = title or display
+        if not last_read or last_msg > last_read:
+            lines.append(f"[UNREAD]  {display:<40}  {label}")
+            unread += 1
+        else:
+            lines.append(f"[read]    {display:<40}  {label}")
+
+    conn.close()
+    lines.append(f"\n{unread} unread")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def thread_cat(slug: str) -> str:
+    """Read a thread by slug and mark it as read."""
+    frame = _load_frame()
+    if not frame or not frame.ready:
+        return "No active frame. Call edge_iam + edge_true (x3) first."
+
+    full_slug = f"thread:{slug}"
+    conn = connect()
+
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT notes FROM edges
+            WHERE subject = %s AND predicate = 'thread-title' AND dissolved_at IS NULL
+            LIMIT 1
+        """, (full_slug,))
+        row = cur.fetchone()
+    title = row[0] if row else slug
+
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT e.notes, f.who, e.created_at,
+                   e.positionality->>'repo' AS repo,
+                   e.positionality->>'branch' AS branch,
+                   e.positionality->>'cwd' AS cwd
+            FROM edges e
+            JOIN frames f ON e.observer = f.token
+            WHERE e.object = %s AND e.predicate = 'thread-wrote' AND e.dissolved_at IS NULL
+            ORDER BY e.created_at ASC
+        """, (full_slug,))
+        messages = cur.fetchall()
+
+    lines = [f"# {title}", ""]
+    for body, who, created_at, repo, branch, cwd in messages:
+        ctx_parts = [p for p in [repo, branch, cwd] if p]
+        ctx = ", ".join(ctx_parts)
+        lines.append("---")
+        lines.append("")
+        header = f"**{who}** — {str(created_at)[:16]}"
+        if ctx:
+            header += f" — _{ctx}_"
+        lines.append(header)
+        lines.append("")
+        lines.append(body or "")
+        lines.append("")
+    lines.append("---")
+
+    # mark read
+    import json as _json
+    pos = _git_context()
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO edges (subject, predicate, object, confidence, phase, observer, positionality)
+            VALUES (%s, 'thread-read', %s, 1.0, 'volatile', %s, %s)
+            ON CONFLICT DO NOTHING
+        """, (frame.token, full_slug, frame.token, _json.dumps(pos)))
+    conn.commit()
+    conn.close()
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def thread_reply(slug: str, body: str) -> str:
+    """Append a message to a thread."""
+    frame = _load_frame()
+    if not frame or not frame.ready:
+        return "No active frame. Call edge_iam + edge_true (x3) first."
+    if not body.strip():
+        return "Empty body — nothing added."
+
+    import json as _json
+    full_slug = f"thread:{slug}"
+    pos = _git_context()
+    conn = connect()
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO edges (subject, predicate, object, confidence, phase, observer, notes, positionality)
+            VALUES (%s, 'thread-wrote', %s, 1.0, 'fluid', %s, %s, %s)
+        """, (frame.token, full_slug, frame.token, body, _json.dumps(pos)))
+        # mark as read
+        cur.execute("""
+            INSERT INTO edges (subject, predicate, object, confidence, phase, observer, positionality)
+            VALUES (%s, 'thread-read', %s, 1.0, 'volatile', %s, %s)
+            ON CONFLICT DO NOTHING
+        """, (frame.token, full_slug, frame.token, _json.dumps(pos)))
+    conn.commit()
+    conn.close()
+    return f"reply added to: {slug}\nby: {frame.who}"
+
+
+@mcp.tool()
+def thread_new(slug: str, title: str = "") -> str:
+    """Create a new thread."""
+    frame = _load_frame()
+    if not frame or not frame.ready:
+        return "No active frame. Call edge_iam + edge_true (x3) first."
+
+    import json as _json
+    full_slug = f"thread:{slug}"
+    label = title or slug
+    pos = _git_context()
+    conn = connect()
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO edges (subject, predicate, object, confidence, phase, observer, notes, positionality)
+            VALUES (%s, 'thread-title', %s, 1.0, 'fluid', %s, %s, %s)
+            ON CONFLICT DO NOTHING
+        """, (full_slug, slug, frame.token, label, _json.dumps(pos)))
+    conn.commit()
+    conn.close()
+    return f"thread created: {slug}\ntitle: {label}\nuse: thread_reply('{slug}', body)"
+
+
 def main():
     mcp.run(transport="stdio")
 
