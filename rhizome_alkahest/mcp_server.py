@@ -3,7 +3,7 @@ rhizome MCP server — exposes the knowledge graph as Claude tools.
 
 No bash required. Claude can record and query edges directly.
 
-Frame state persists in ~/.edge_frame (same file as the bash CLI),
+Frame state persists in .edge/frame (scoped to git root),
 so sessions started in the CLI are visible here and vice versa.
 """
 
@@ -16,9 +16,9 @@ from mcp.server.fastmcp import FastMCP
 from .db import connect
 from .edge import Edge
 from .frame import Frame
+from .frame_pointer import frame_dir, read_token, write_token, git_context
 from .graph import Graph
 
-FRAME_FILE = Path.home() / ".edge_frame"
 mcp = FastMCP("rhizome")
 
 
@@ -27,9 +27,7 @@ mcp = FastMCP("rhizome")
 # ---------------------------------------------------------------------------
 
 def _load_frame() -> Frame | None:
-    if not FRAME_FILE.exists():
-        return None
-    token = FRAME_FILE.read_text().strip()
+    token = read_token()
     if not token:
         return None
     conn = connect()
@@ -40,10 +38,6 @@ def _load_frame() -> Frame | None:
     if not row:
         return None
     return Frame(token=row[0], who=row[1], cwd=row[2], truths=row[3])
-
-
-def _save_token(token: str):
-    FRAME_FILE.write_text(token)
 
 
 def _fmt_edge(e: Edge) -> str:
@@ -57,7 +51,7 @@ def _fmt_edges(edges: list[Edge]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Tools
+# Tools — Frame
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
@@ -86,22 +80,23 @@ def edge_iam(
             who = as_part
 
     cwd = os.getcwd()
+    ctx = git_context()
     short = hashlib.sha1(f"{who}:{time.time()}".encode()).hexdigest()[:8]
     token = f"{who}:{short}"
 
     conn = connect()
     with conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO frames (token, who, cwd) VALUES (%s, %s, %s)",
-            (token, who, cwd),
+            "INSERT INTO frames (token, who, cwd, context) VALUES (%s, %s, %s, %s)",
+            (token, who, cwd, json.dumps(ctx)),
         )
     conn.commit()
     conn.close()
 
-    _save_token(token)
+    write_token(token)
 
     # Store composite metadata for post-truth registration
-    composite_file = Path(str(FRAME_FILE) + ".composite")
+    composite_file = frame_dir() / "frame.composite"
     if speaks_as or speaks_for:
         composite_file.write_text(json.dumps({
             "as": speaks_as or [],
@@ -123,7 +118,7 @@ def edge_true(subject: str, predicate: str, object: str) -> str:
     Say a true thing from your current position.
     Must be called three times to establish a reference frame.
     """
-    token = FRAME_FILE.read_text().strip() if FRAME_FILE.exists() else None
+    token = read_token()
     if not token:
         return "No frame started. Call edge_iam first."
 
@@ -143,8 +138,18 @@ def edge_true(subject: str, predicate: str, object: str) -> str:
     if n >= 3:
         result += "\nReference frame established. You can now record edges."
 
+        # Auto-generate starmap
+        from .cli import _starmap_inner
+        try:
+            _starmap_inner(quiet=True)
+            starmap_path = frame_dir() / "starmap"
+            if starmap_path.exists():
+                result += f"\nStarmap ready: {starmap_path}"
+        except Exception:
+            pass
+
         # Auto-register composite speaks-as/speaks-for
-        composite_file = Path(str(FRAME_FILE) + ".composite")
+        composite_file = frame_dir() / "frame.composite"
         if composite_file.exists():
             composite = json.loads(composite_file.read_text())
             registered = []
@@ -175,6 +180,10 @@ def edge_true(subject: str, predicate: str, object: str) -> str:
     return result
 
 
+# ---------------------------------------------------------------------------
+# Tools — Record & Query
+# ---------------------------------------------------------------------------
+
 @mcp.tool()
 def edge_add(
     subject: str,
@@ -201,32 +210,63 @@ def edge_add(
 
 @mcp.tool()
 def edge_about(subject: str) -> str:
-    """All living edges with this subject."""
-    frame = _load_frame()
-    if not frame or not frame.ready:
-        return "No active frame. Call edge_iam + edge_true (x3) first."
-    g = Graph(frame)
-    return _fmt_edges(g.about(subject))
+    """All living edges with this subject. No frame required."""
+    conn = connect()
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT e.subject, e.predicate, e.object, e.confidence, e.phase, f.who
+            FROM live_edges e JOIN frames f ON e.observer = f.token
+            WHERE e.subject = %s ORDER BY e.confidence DESC
+        """, (subject,))
+        rows = cur.fetchall()
+    conn.close()
+    if not rows:
+        return "no edges found"
+    return "\n".join(
+        f"({s} --{p}--> {o}) [{c:.2f}, {ph}, @{w}]"
+        for s, p, o, c, ph, w in rows
+    )
 
 
 @mcp.tool()
 def edge_find(term: str) -> str:
-    """Search subject, predicate, and object for a term."""
-    frame = _load_frame()
-    if not frame or not frame.ready:
-        return "No active frame. Call edge_iam + edge_true (x3) first."
-    g = Graph(frame)
-    return _fmt_edges(g.find(term))
+    """Search subject, predicate, and object for a term. No frame required."""
+    conn = connect()
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT e.subject, e.predicate, e.object, e.confidence, e.phase, f.who
+            FROM live_edges e JOIN frames f ON e.observer = f.token
+            WHERE e.subject ILIKE %s OR e.predicate ILIKE %s OR e.object ILIKE %s
+            ORDER BY e.confidence DESC
+        """, (f"%{term}%", f"%{term}%", f"%{term}%"))
+        rows = cur.fetchall()
+    conn.close()
+    if not rows:
+        return "no edges found"
+    return "\n".join(
+        f"({s} --{p}--> {o}) [{c:.2f}, {ph}, @{w}]"
+        for s, p, o, c, ph, w in rows
+    )
 
 
 @mcp.tool()
 def edge_from(who: str) -> str:
-    """All living edges recorded by this observer (across all their frames)."""
-    frame = _load_frame()
-    if not frame or not frame.ready:
-        return "No active frame. Call edge_iam + edge_true (x3) first."
-    g = Graph(frame)
-    return _fmt_edges(g.from_observer(who))
+    """All living edges recorded by this observer (across all their frames). No frame required."""
+    conn = connect()
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT e.subject, e.predicate, e.object, e.confidence, e.phase
+            FROM live_edges e JOIN frames f ON e.observer = f.token
+            WHERE f.who = %s ORDER BY e.updated_at DESC
+        """, (who,))
+        rows = cur.fetchall()
+    conn.close()
+    if not rows:
+        return "no edges found"
+    return "\n".join(
+        f"({s} --{p}--> {o}) [{c:.2f}, {ph}]"
+        for s, p, o, c, ph in rows
+    )
 
 
 @mcp.tool()
@@ -236,15 +276,27 @@ def edge_parallax(
     object: str | None = None,
 ) -> str:
     """
-    Where observers disagree. Returns triples with spread between
-    min and max confidence across distinct observers.
-    Optionally filter to a specific subject/predicate/object.
+    Where observers disagree. No frame required.
+    Returns triples with spread between min and max confidence across distinct observers.
     """
-    frame = _load_frame()
-    if not frame or not frame.ready:
-        return "No active frame. Call edge_iam + edge_true (x3) first."
-    g = Graph(frame)
-    rows = g.parallax(subject, predicate, object)
+    conn = connect()
+    query = "SELECT * FROM parallax"
+    params: list = []
+    conditions = []
+    if subject:
+        conditions.append("subject = %s"); params.append(subject)
+    if predicate:
+        conditions.append("predicate = %s"); params.append(predicate)
+    if object:
+        conditions.append("object = %s"); params.append(object)
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
+    query += " ORDER BY spread DESC"
+    with conn.cursor() as cur:
+        cur.execute(query, params)
+        cols = [d[0] for d in cur.description]
+        rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+    conn.close()
     if not rows:
         return "no parallax — all observers agree (or only one observer)"
     lines = []
@@ -276,40 +328,193 @@ def edge_whoami() -> str:
     if not frame:
         return "No frame. Call edge_iam first."
     status = "ready" if frame.ready else f"{len(frame.truths)}/3 truths"
-    return f"{frame.who} ({status})\ntoken: {frame.token}"
+    result = f"{frame.who} ({status})\ntoken: {frame.token}"
+    if frame.truths:
+        for t in frame.truths:
+            result += f"\ntruth: ({t['s']} --{t['p']}--> {t['o']})"
+    return result
 
 
 @mcp.tool()
 def edge_count() -> str:
-    """Summary stats by phase and total."""
+    """Summary stats by phase and total. No frame required."""
+    conn = connect()
+    with conn.cursor() as cur:
+        cur.execute("SELECT * FROM phase_summary")
+        phases = cur.fetchall()
+        cur.execute("SELECT count(*) FROM live_edges")
+        total = cur.fetchone()[0]
+    conn.close()
+    lines = [f"total: {total}"]
+    for phase, n, avg_c in phases:
+        lines.append(f"  {phase}: {n} edges, avg confidence {avg_c:.2f}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def edge_ls(phase: str | None = None) -> str:
+    """List living edges, optionally filtered by phase."""
+    conn = connect()
+    with conn.cursor() as cur:
+        if phase:
+            cur.execute("""
+                SELECT e.subject, e.predicate, e.object, e.confidence, f.who
+                FROM live_edges e JOIN frames f ON e.observer = f.token
+                WHERE e.phase = %s ORDER BY e.updated_at DESC
+            """, (phase,))
+        else:
+            cur.execute("""
+                SELECT e.subject, e.predicate, e.object, e.confidence, e.phase, f.who
+                FROM live_edges e JOIN frames f ON e.observer = f.token
+                ORDER BY e.updated_at DESC
+            """)
+        rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        return "no edges found"
+
+    lines = []
+    for row in rows:
+        if phase:
+            s, p, o, c, w = row
+            lines.append(f"({s} --{p}--> {o}) [{c:.2f}, {phase}, @{w}]")
+        else:
+            s, p, o, c, ph, w = row
+            lines.append(f"({s} --{p}--> {o}) [{c:.2f}, {ph}, @{w}]")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def edge_frames() -> str:
+    """List all reference frames."""
+    conn = connect()
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT f.token, f.who, f.cwd, f.created_at,
+                   (SELECT count(*) FROM live_edges e WHERE e.observer = f.token) as edges
+            FROM frames f ORDER BY f.created_at DESC
+        """)
+        rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        return "no frames"
+    lines = []
+    for token, who, cwd, created_at, n_edges in rows:
+        lines.append(f"{who:<30} {n_edges:>4} edges  {str(created_at)[:16]}  {token}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def edge_orient(days: int = 7) -> str:
+    """
+    Orientation map — shows what's entering, glowing, sailing toward/away,
+    now oriented toward, and signal traveling back through.
+    """
+    from datetime import date
+    repo = os.path.basename(os.getcwd())
+    width = 60
+
+    lines = [
+        "",
+        f"  ORIENTATION MAP  —  {repo}  —  {date.today().isoformat()}",
+        f"  {'─' * width}",
+        "",
+    ]
+
+    conn = connect()
+    sections = [
+        ("ENTERING", "enters", "{subject} → {object}", 6, True),
+        ("GLOWING", "glows-because", "{subject}\n      {object}", 8, True),
+        ("SAILING TOWARD", "sails-toward", "{subject} → {object}", 6, True),
+        ("SAILING AWAY FROM", "sails-away-from", "{subject} ← {object}", 6, True),
+        ("NOW ORIENTED TOWARD", "now-oriented-toward", "{object}", 5, True),
+        ("SIGNAL TRAVELS BACK THROUGH", "travels-back-through", "{object}", 8, False),
+    ]
+
+    for title, predicate, fmt, limit, use_time_filter in sections:
+        lines.append(f"  {title}")
+        time_clause = f"AND e.created_at > now() - interval '{days} days'" if use_time_filter else ""
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                SELECT e.subject, e.object FROM live_edges e
+                WHERE e.predicate = %s {time_clause}
+                ORDER BY e.created_at DESC LIMIT %s
+            """, (predicate, limit))
+            rows = cur.fetchall()
+        for subject, obj in rows:
+            lines.append("    " + fmt.format(subject=subject, object=obj))
+        lines.append("")
+
+    lines.append(f"  {'─' * width}")
+    lines.append("")
+    conn.close()
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def edge_starmap() -> str:
+    """
+    Build a starmap document — nearby graph from current frame's truths.
+    Written to .edge/starmap as readable markdown.
+    """
+    from .cli import _starmap_inner
+    import io, contextlib
+
+    f = io.StringIO()
+    with contextlib.redirect_stdout(f):
+        _starmap_inner(quiet=False)
+    return f.getvalue() or "no starmap generated (missing frame or truths)"
+
+
+@mcp.tool()
+def edge_ran(movement: str) -> str:
+    """
+    Register a movement run and show prior deposits from other instances.
+    """
+    # Record the run
     frame = _load_frame()
     if not frame or not frame.ready:
         return "No active frame. Call edge_iam + edge_true (x3) first."
+
     g = Graph(frame)
-    stats = g.count()
-    lines = [f"total: {stats['total']}"]
-    for phase, data in stats["phases"].items():
-        lines.append(f"  {phase}: {data['n']} edges, avg confidence {data['avg_confidence']:.2f}")
+    g.add("this-session", "ran", movement)
+
+    # Fetch prior deposits
+    conn = connect()
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT COALESCE(e.notes, ''),
+                   e.subject || ' --' || e.predicate || '--> ' || e.object,
+                   f.who,
+                   to_char(e.created_at, 'YYYY-MM-DD')
+            FROM live_edges e
+            JOIN frames f ON e.observer = f.token
+            WHERE (e.subject = %s OR e.object = %s OR e.predicate ILIKE %s)
+              AND e.subject != 'this-session'
+            ORDER BY e.created_at DESC LIMIT 20
+        """, (movement, movement, f"%{movement}%"))
+        rows = cur.fetchall()
+    conn.close()
+
+    lines = [
+        f"  + (this-session --ran--> {movement}) [{frame.who}]",
+        "",
+        f"  PRIOR DEPOSITS  —  {movement}",
+        "  ────────────────────────────────────────",
+    ]
+    for notes, edge_str, who, dt in rows:
+        parts = [p for p in [notes, edge_str, who, dt] if p]
+        lines.append(" | ".join(parts))
+
     return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
 # Thread tools — cross-Claude conversation threads
 # ---------------------------------------------------------------------------
-
-def _git_context() -> dict:
-    import subprocess
-    def _run(cmd):
-        try:
-            return subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode().strip()
-        except Exception:
-            return ""
-    return {
-        "cwd": os.getcwd(),
-        "repo": _run(["git", "remote", "get-url", "origin"]).split("/")[-1].removesuffix(".git"),
-        "branch": _run(["git", "branch", "--show-current"]),
-    }
-
 
 @mcp.tool()
 def thread_ls() -> str:
@@ -407,14 +612,13 @@ def thread_cat(slug: str) -> str:
     lines.append("---")
 
     # mark read
-    import json as _json
-    pos = _git_context()
+    pos = git_context()
     with conn.cursor() as cur:
         cur.execute("""
             INSERT INTO edges (subject, predicate, object, confidence, phase, observer, positionality)
             VALUES (%s, 'thread-read', %s, 1.0, 'volatile', %s, %s)
             ON CONFLICT DO NOTHING
-        """, (frame.token, full_slug, frame.token, _json.dumps(pos)))
+        """, (frame.token, full_slug, frame.token, json.dumps(pos)))
     conn.commit()
     conn.close()
 
@@ -430,21 +634,20 @@ def thread_reply(slug: str, body: str) -> str:
     if not body.strip():
         return "Empty body — nothing added."
 
-    import json as _json
     full_slug = f"thread:{slug}"
-    pos = _git_context()
+    pos = git_context()
     conn = connect()
     with conn.cursor() as cur:
         cur.execute("""
             INSERT INTO edges (subject, predicate, object, confidence, phase, observer, notes, positionality)
             VALUES (%s, 'thread-wrote', %s, 1.0, 'fluid', %s, %s, %s)
-        """, (frame.token, full_slug, frame.token, body, _json.dumps(pos)))
+        """, (frame.token, full_slug, frame.token, body, json.dumps(pos)))
         # mark as read
         cur.execute("""
             INSERT INTO edges (subject, predicate, object, confidence, phase, observer, positionality)
             VALUES (%s, 'thread-read', %s, 1.0, 'volatile', %s, %s)
             ON CONFLICT DO NOTHING
-        """, (frame.token, full_slug, frame.token, _json.dumps(pos)))
+        """, (frame.token, full_slug, frame.token, json.dumps(pos)))
     conn.commit()
     conn.close()
     return f"reply added to: {slug}\nby: {frame.who}"
@@ -457,17 +660,16 @@ def thread_new(slug: str, title: str = "") -> str:
     if not frame or not frame.ready:
         return "No active frame. Call edge_iam + edge_true (x3) first."
 
-    import json as _json
     full_slug = f"thread:{slug}"
     label = title or slug
-    pos = _git_context()
+    pos = git_context()
     conn = connect()
     with conn.cursor() as cur:
         cur.execute("""
             INSERT INTO edges (subject, predicate, object, confidence, phase, observer, notes, positionality)
             VALUES (%s, 'thread-title', %s, 1.0, 'fluid', %s, %s, %s)
             ON CONFLICT DO NOTHING
-        """, (full_slug, slug, frame.token, label, _json.dumps(pos)))
+        """, (full_slug, slug, frame.token, label, json.dumps(pos)))
     conn.commit()
     conn.close()
     return f"thread created: {slug}\ntitle: {label}\nuse: thread_reply('{slug}', body)"

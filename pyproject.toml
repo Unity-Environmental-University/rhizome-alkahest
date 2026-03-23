@@ -19,6 +19,7 @@ vector = ["sentence-transformers>=2.2"]
 
 [project.scripts]
 rhizome-mcp = "rhizome_alkahest.mcp_server:main"
+edge = "rhizome_alkahest.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["rhizome_alkahest*"]

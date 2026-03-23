@@ -37,7 +37,7 @@ edge true the_gap is_where hyphae_go
 edge add unsaying is_same_structure_as wave_collapse
 edge add tolkien learned finnish --confidence 0.9 --note "Exeter College library, 1912"
 
-# Query
+# Query (no frame required)
 edge about hallie          # edges from this subject
 edge find apophatic        # search everywhere
 edge from claude           # the graph as seen by claude
@@ -48,6 +48,11 @@ edge ls                    # all edges
 edge ls salt               # just precipitated ones
 edge count                 # summary
 edge dissolve x is y       # soft-delete
+
+# Navigate
+edge orient [days]         # orientation map (default 7d)
+edge starmap               # nearby graph from truths → .edge/starmap
+edge ran <movement>        # register a qigong run + show prior deposits
 ```
 
 ## Phase dissolution
@@ -58,6 +63,7 @@ edge dissolve x is y       # soft-delete
 
 ## Reference frames
 
+Reading the graph requires no frame. Recording requires one.
 To record edges you must first establish where you're standing.
 `edge iam <who>` starts a frame. Then say three true things from
 your current position. That triangulates your reference frame.
@@ -67,13 +73,21 @@ The parallax between frames is data, not noise.
 
 ## Schema
 
-- `frames` — reference frames (token, who, cwd, truths)
-- `edges` — the atoms (s, p, o, confidence, phase, observer, notes, embedding)
+- `frames` — reference frames (token, who, cwd, truths, context)
+- `edges` — the atoms (s, p, o, confidence, phase, observer, notes, positionality, embedding)
 - `steps` — otter loop history
 - `sessions` — conversation provenance
 - `live_edges` — view: undissolved edges only
 - `phase_summary` — view: counts by phase
 - `parallax` — view: where observers disagree
+
+## Architecture
+
+The `edge` CLI is a thin bash dispatch to `python -m rhizome_alkahest`.
+The MCP server (`rhizome_alkahest/mcp_server.py`) uses the same Python code.
+One implementation, two interfaces.
+
+Frame state lives in `.edge/frame` under the git root (scoped per-repo).
 
 ## Design principles
 

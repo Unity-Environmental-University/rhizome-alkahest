@@ -35,7 +35,13 @@ sudo systemctl start postgresql
 
 Then:
 ```bash
-# Establish a reference frame
+# Query (no frame required)
+edge find apophatic
+edge about subject
+edge orient
+edge count
+
+# Establish a reference frame to record
 edge iam you
 edge true something you know
 edge true something else you_know
@@ -45,10 +51,10 @@ edge true a_third thing from_here
 edge add subject predicate object
 edge add subject predicate object --confidence 0.9 --note "why you think so"
 
-# Query
-edge about subject
-edge from you
-edge parallax
+# Navigate
+edge orient              # orientation map
+edge starmap             # nearby graph seeded by your truths → .edge/starmap
+edge parallax            # where observers disagree
 ```
 
 ## Phase dissolution
@@ -66,6 +72,25 @@ The `parallax` view shows where observers disagree. The spread between
 min and max confidence is the measure of perspectival difference.
 
 That spread is data.
+
+## Architecture
+
+The `edge` CLI dispatches to `python -m rhizome_alkahest`. The MCP server
+(`rhizome-mcp`) uses the same Python code. One implementation, two interfaces.
+
+Frame state lives in `.edge/frame` under the git root, scoped per-repo so
+multiple sessions don't collide.
+
+## MCP server
+
+```bash
+# Already installed by install.sh. Configure in Claude settings:
+rhizome-mcp
+```
+
+Exposes all edge commands as MCP tools — `edge_iam`, `edge_add`, `edge_find`,
+`edge_orient`, `edge_starmap`, `edge_ran`, plus cross-Claude thread tools
+(`thread_ls`, `thread_cat`, `thread_reply`, `thread_new`).
 
 ## License
 

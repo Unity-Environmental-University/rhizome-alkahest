@@ -1,5 +1,6 @@
 """Graph — the interface to the knowledge graph."""
 
+import json
 from typing import Optional
 
 import psycopg
@@ -7,6 +8,7 @@ import psycopg
 from .db import connect
 from .edge import Edge
 from .frame import Frame
+from .frame_pointer import git_context
 
 
 class Graph:
@@ -28,13 +30,14 @@ class Graph:
         notes: str = "",
     ) -> Edge:
         """Record an edge from this frame's position."""
+        pos = json.dumps(git_context())
         with self.conn.cursor() as cur:
             cur.execute(
-                """INSERT INTO edges (subject, predicate, object, confidence, phase, observer, notes)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """INSERT INTO edges (subject, predicate, object, confidence, phase, observer, notes, positionality)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                    ON CONFLICT DO NOTHING
                    RETURNING id, created_at""",
-                (subject, predicate, object, confidence, phase, self.frame.token, notes),
+                (subject, predicate, object, confidence, phase, self.frame.token, notes, pos),
             )
             row = cur.fetchone()
         self.conn.commit()

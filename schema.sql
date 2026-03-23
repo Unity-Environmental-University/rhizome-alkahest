@@ -17,6 +17,7 @@ CREATE TABLE frames (
     who             TEXT NOT NULL,
     cwd             TEXT,
     truths          JSONB NOT NULL DEFAULT '[]',
+    context         JSONB NOT NULL DEFAULT '{}',
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -44,6 +45,7 @@ CREATE TABLE edges (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     notes           TEXT DEFAULT '',
+    positionality   JSONB NOT NULL DEFAULT '{}',
     dissolved_at    TIMESTAMPTZ,
     embedding       vector(384)
 );
