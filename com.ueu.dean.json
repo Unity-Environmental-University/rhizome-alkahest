@@ -1,0 +1,9 @@
+{
+  "name": "com.ueu.dean",
+  "description": "Rhizome native messaging host for the UEU dean extension",
+  "path": "/Users/hlarsson/repos/unity/rhizome-alkahest/rhizome_alkahest/native_host.py",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://CHROME_EXTENSION_ID/"
+  ]
+}

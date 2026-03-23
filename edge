@@ -297,8 +297,134 @@ case "$cmd" in
         "
         $PSQL "$DB" -c "SELECT count(*) as total FROM live_edges;"
         ;;
+    isomorph)
+        local_limit=5
+        local_dry_run=false
+        local_min_jaccard=0.3
+        local_verbose=true
+        local_who=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --limit) local_limit="$2"; shift 2 ;;
+                --min-jaccard) local_min_jaccard="$2"; shift 2 ;;
+                --who) local_who="$2"; shift 2 ;;
+                --dry-run) local_dry_run=true; shift ;;
+                --quiet) local_verbose=false; shift ;;
+                *) shift ;;
+            esac
+        done
+        python3 - "$local_limit" "$local_min_jaccard" "$local_dry_run" "$local_verbose" "$local_who" <<'PYEOF'
+import sys
+from rhizome_alkahest.digest import IsomorphFinder, default_who
+limit = int(sys.argv[1])
+min_jaccard = float(sys.argv[2])
+dry_run = sys.argv[3] == "true"
+verbose = sys.argv[4] == "true"
+who = sys.argv[5] if sys.argv[5] else default_who()
+IsomorphFinder(who=who).run(limit=limit, min_jaccard=min_jaccard, dry_run=dry_run, verbose=verbose)
+PYEOF
+        ;;
+    orient)
+        local_days="${1:-7}"
+        local_width=60
+        echo ""
+        echo "  ORIENTATION MAP  —  $(basename $(pwd))  —  $(date +%Y-%m-%d)"
+        echo "  $(printf '%.0s─' $(seq 1 $local_width))"
+        echo ""
+
+        echo "  ENTERING"
+        $PSQL -At "$DB" -c "
+            SELECT '    ' || e.subject || ' → ' || e.object
+            FROM live_edges e
+            WHERE e.predicate = 'enters'
+              AND e.created_at > now() - interval '$local_days days'
+            ORDER BY e.created_at DESC LIMIT 6;
+        " | sed 's/|//'
+        echo ""
+
+        echo "  GLOWING"
+        $PSQL -At "$DB" -c "
+            SELECT '    ' || e.subject || E'\n      ' || e.object
+            FROM live_edges e
+            WHERE e.predicate = 'glows-because'
+              AND e.created_at > now() - interval '$local_days days'
+            ORDER BY e.created_at DESC LIMIT 8;
+        " | sed 's/|//'
+        echo ""
+
+        echo "  SAILING TOWARD"
+        $PSQL -At "$DB" -c "
+            SELECT '    ' || e.subject || ' → ' || e.object
+            FROM live_edges e
+            WHERE e.predicate = 'sails-toward'
+              AND e.created_at > now() - interval '$local_days days'
+            ORDER BY e.created_at DESC LIMIT 6;
+        " | sed 's/|//'
+        echo ""
+
+        echo "  SAILING AWAY FROM"
+        $PSQL -At "$DB" -c "
+            SELECT '    ' || e.subject || ' ← ' || e.object
+            FROM live_edges e
+            WHERE e.predicate = 'sails-away-from'
+              AND e.created_at > now() - interval '$local_days days'
+            ORDER BY e.created_at DESC LIMIT 6;
+        " | sed 's/|//'
+        echo ""
+
+        echo "  NOW ORIENTED TOWARD"
+        $PSQL -At "$DB" -c "
+            SELECT '    ' || e.object
+            FROM live_edges e
+            WHERE e.predicate = 'now-oriented-toward'
+              AND e.created_at > now() - interval '$local_days days'
+            ORDER BY e.created_at DESC LIMIT 5;
+        " | sed 's/|//'
+        echo ""
+
+        echo "  SIGNAL TRAVELS BACK THROUGH"
+        $PSQL -At "$DB" -c "
+            SELECT '    ' || e.object
+            FROM live_edges e
+            WHERE e.predicate = 'travels-back-through'
+            ORDER BY e.created_at DESC LIMIT 8;
+        " | sed 's/|//'
+        echo ""
+        echo "  $(printf '%.0s─' $(seq 1 $local_width))"
+        echo ""
+        ;;
     raw)
         $PSQL "$DB" -c "$*"
+        ;;
+    digest)
+        local_limit=5
+        local_dry_run=false
+        local_min_spread=0.05
+        local_verbose=true
+        local_who=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --limit) local_limit="$2"; shift 2 ;;
+                --min-spread) local_min_spread="$2"; shift 2 ;;
+                --who) local_who="$2"; shift 2 ;;
+                --dry-run) local_dry_run=true; shift ;;
+                --quiet) local_verbose=false; shift ;;
+                *) shift ;;
+            esac
+        done
+        local_args="--limit $local_limit --min-spread $local_min_spread"
+        [[ "$local_dry_run" == true ]] && local_args="$local_args --dry-run"
+        [[ "$local_verbose" == false ]] && local_args="$local_args --quiet"
+        python3 - "$local_limit" "$local_min_spread" "$local_dry_run" "$local_verbose" "$local_who" <<'PYEOF'
+import sys
+from rhizome_alkahest.digest import ParallaxDigest, default_who
+limit = int(sys.argv[1])
+min_spread = float(sys.argv[2])
+dry_run = sys.argv[3] == "true"
+verbose = sys.argv[4] == "true"
+who = sys.argv[5] if sys.argv[5] else default_who()
+ParallaxDigest(who=who).run(limit=limit, min_spread=min_spread, dry_run=dry_run, verbose=verbose)
+PYEOF
         ;;
     help|-h|--help)
         echo "Establish a reference frame:"
@@ -320,6 +446,11 @@ case "$cmd" in
         echo "  edge dissolve <s> <p> <o>              soft-delete"
         echo "  edge count                             summary"
         echo "  edge raw <sql>                         escape hatch"
+        echo ""
+        echo "Discover:"
+        echo "  edge digest [--limit N] [--min-spread F] [--who 'name'] [--dry-run]  parallax digest via Qwen"
+        echo "  edge isomorph [--limit N] [--min-jaccard F] [--who 'name'] [--dry-run]  find structural isomorphisms"
+        echo "  edge orient [days]                         orientation map (navigation predicates, default 7d)"
         ;;
     *)
         echo "unknown command: $cmd"
