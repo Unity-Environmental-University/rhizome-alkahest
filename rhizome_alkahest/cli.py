@@ -1200,11 +1200,14 @@ def cmd_help(args):
     print("  edge starmap                           nearby graph from truths → .edge/starmap")
     print("  edge garden [--limit N]                surface edges that need tending")
     print("  edge name <hash> <slug>                give an existing edge a slug")
+    print("  edge decompose <hash> s p o [s p o..]  break a long edge into parts")
     print("  edge words [--limit N]                 vocabulary frequency across the graph")
+    print("  edge say <sentence...>                 polysynthetic: graph predicates become grammar")
+    print("  edge say --dry                         parse only, don't record")
 
 
 # ---------------------------------------------------------------------------
-# Stewardship — garden, name, words
+# Stewardship — garden, name, decompose, words
 # ---------------------------------------------------------------------------
 
 def cmd_garden(args):
@@ -1401,6 +1404,160 @@ def cmd_words(args):
 
 
 # ---------------------------------------------------------------------------
+# Polysynthetic grammar — edge say
+# ---------------------------------------------------------------------------
+
+def _load_grammar(conn, min_uses: int = 5) -> set[str]:
+    """Load the graph's own grammar: predicates used often enough to be particles."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT predicate, count(*) AS n
+            FROM live_edges
+            WHERE predicate NOT IN ('outcome', 'valuation', 'move-chosen', 'board-string')
+            GROUP BY predicate
+            HAVING count(*) >= %s
+            ORDER BY n DESC
+        """, (min_uses,))
+        return {row[0] for row in cur.fetchall()}
+
+
+def _parse_say(tokens: list[str], grammar: set[str]) -> list[tuple[str, list[str]]]:
+    """Parse a sentence using graph-derived grammar.
+
+    Known predicates act as clause-splitting particles after the first triple.
+    Returns [(particle, [words...]), ...] where first clause has particle=''.
+    """
+    clauses = []
+    current_particle = ""
+    current_words = []
+    have_first_triple = False
+
+    for tok in tokens:
+        if have_first_triple and tok in grammar and len(current_words) >= 1:
+            clauses.append((current_particle, current_words))
+            current_particle = tok
+            current_words = []
+        else:
+            current_words.append(tok)
+            if not have_first_triple and len(current_words) >= 3:
+                # Check if word 2 (index 1) is the predicate of a complete triple
+                # Don't split yet — just mark that we have a base triple
+                pass
+
+    if current_words:
+        clauses.append((current_particle, current_words))
+
+    # Post-process: the first clause must be a triple (3+ words).
+    # If only one clause, it's a simple triple — no grammar active.
+    if clauses and len(clauses[0][1]) >= 3:
+        have_first_triple = True
+
+    # Re-parse with first triple knowledge if needed
+    if not have_first_triple:
+        return clauses
+
+    # Actually we need to re-parse since we didn't split on the first pass correctly.
+    # Let me do it properly: first 3 words are always the base triple.
+    # Everything after is parsed for grammar particles.
+    if len(tokens) < 3:
+        return [("", tokens)]
+
+    base = tokens[:3]
+    rest = tokens[3:]
+    clauses = [("", base)]
+
+    if not rest:
+        return clauses
+
+    current_particle = ""
+    current_words = []
+
+    for tok in rest:
+        if tok in grammar and len(current_words) >= 1:
+            clauses.append((current_particle, current_words))
+            current_particle = tok
+            current_words = []
+        elif tok in grammar and len(current_words) == 0:
+            # Particle right after another particle or right after base triple
+            current_particle = tok
+        else:
+            current_words.append(tok)
+
+    if current_words:
+        clauses.append((current_particle, current_words))
+
+    return clauses
+
+
+def cmd_say(args):
+    """Polysynthetic edge creation. Graph predicates become grammar particles.
+
+    edge say hallie builds rooms from inhabitation
+    → (hallie --builds--> rooms) + (rooms --from--> inhabitation)
+
+    edge say shear is zpd-boundary glows-because apophasis
+    → (shear --is--> zpd-boundary) + (zpd-boundary --glows-because--> apophasis)
+    """
+    dry = "--dry" in args
+    args = [a for a in args if a != "--dry"]
+
+    if len(args) < 3:
+        print("usage: edge say <word> <word> <word> [<word>...]")
+        print("  known predicates from the graph become clause separators")
+        sys.exit(1)
+
+    conn = connect()
+    grammar = _load_grammar(conn)
+    conn.close()
+
+    clauses = _parse_say(args, grammar)
+
+    if dry:
+        print(f"  grammar particles ({len(grammar)}): {', '.join(sorted(grammar)[:20])}...")
+        print()
+        for particle, words in clauses:
+            if particle:
+                print(f"  [{particle}]")
+            if len(words) >= 3:
+                print(f"    ({words[0]} --{words[1]}--> {words[2]})")
+            elif len(words) == 2:
+                print(f"    (prev.object --{words[0]}--> {words[1]})")
+            elif len(words) == 1:
+                print(f"    (prev.subject --{particle}--> {words[0]})")
+        return
+
+    frame = _require_frame()
+    g = Graph(frame)
+    prev_edge = None
+
+    for idx, (particle, words) in enumerate(clauses):
+        if len(words) >= 3:
+            s, p, o = words[0], words[1], words[2]
+        elif len(words) == 2 and prev_edge:
+            # 2 words after particle: previous object chains forward
+            s, p, o = prev_edge.object, words[0], words[1]
+        elif len(words) == 1 and prev_edge:
+            # 1 word after particle: previous subject, particle as predicate
+            s, p, o = prev_edge.subject, particle, words[0]
+        else:
+            print(f"  error: can't parse clause after '{particle}': {words}")
+            sys.exit(1)
+
+        s = _resolve_subject(s, g)
+        edge = g.add(s, p, o)
+        print(f"  + {_fmt_edge(edge)}  #{edge.hash}")
+
+        # Link clauses via particle (edge-as-subject)
+        if particle and prev_edge:
+            prev_ref = f"e:{prev_edge.subject}/{prev_edge.predicate}/{prev_edge.object}"
+            this_ref = f"e:{edge.subject}/{edge.predicate}/{edge.object}"
+            link = g.add(prev_ref, particle, this_ref)
+            print(f"    {particle} → #{link.hash}")
+
+        prev_edge = edge
+
+
+# ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
 
@@ -1430,6 +1587,7 @@ COMMANDS = {
     "name": cmd_name,
     "decompose": cmd_decompose,
     "words": cmd_words,
+    "say": cmd_say,
     "help": cmd_help,
     "-h": cmd_help,
     "--help": cmd_help,
