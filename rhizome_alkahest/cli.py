@@ -438,6 +438,10 @@ def cmd_orient(args):
             truth_terms = [r[0] for r in cur.fetchall()]
         c.close()
 
+    # Print starmap first (subjective layer) if frame is established
+    if truth_terms:
+        _starmap_inner(quiet=False)
+
     print()
     header = f"  ORIENTATION MAP  —  {repo}  —  {date.today().isoformat()}"
     if truth_terms:
@@ -495,15 +499,7 @@ def cmd_orient(args):
     print()
     conn.close()
 
-    # Refresh starmap if frame is established
-    if token:
-        c = connect()
-        with c.cursor() as cur:
-            cur.execute("SELECT jsonb_array_length(truths) FROM frames WHERE token = %s", (token,))
-            row = cur.fetchone()
-        c.close()
-        if row and row[0] >= 3:
-            _starmap_inner(quiet=True)
+    # starmap already printed and written at the top of orient (if frame established)
 
 
 def cmd_ran(args):
@@ -717,6 +713,369 @@ def cmd_isomorph(args):
     IsomorphFinder(who=who).run(limit=limit, min_jaccard=min_jaccard, dry_run=dry_run, verbose=verbose)
 
 
+def cmd_attend(args):
+    """Subjective attention: what in the graph is most relevant to the current frame's truths?
+
+    Scores every knowledge edge by:
+      1. Term overlap with truth terms (direct relevance)
+      2. Phase weight: salt × 1.5, fluid × 1.0, volatile × 0.7
+      3. Co-occurrence boost: edges that share terms with truth-adjacent edges
+      4. Parallax boost: edges with high spread get attention (disagreement is interesting)
+
+    --parallax: show where individual truths disagree about what matters
+    --limit N: how many results (default 20)
+    """
+    import math
+    from collections import Counter
+
+    do_parallax = "--parallax" in args
+    limit = 20
+    i = 0
+    while i < len(args):
+        if args[i] == "--limit" and i + 1 < len(args):
+            limit = int(args[i + 1]); i += 2
+        else:
+            i += 1
+
+    frame = _require_frame()
+
+    conn = connect()
+
+    # Extract truth terms
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT t->>'s' as s, t->>'p' as p, t->>'o' as o
+            FROM frames, jsonb_array_elements(truths) AS t
+            WHERE token = %s
+        """, (frame.token,))
+        truths = cur.fetchall()
+
+    truth_terms = set()
+    for s, p, o in truths:
+        truth_terms.update([s, p, o])
+    truth_terms.discard(None)
+
+    if not truth_terms:
+        print("  no truths in frame — nothing to attend from")
+        conn.close()
+        return
+
+    # Fetch all knowledge edges (exclude game edges)
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT e.subject, e.predicate, e.object, e.confidence, e.phase,
+                   f.who, e.notes
+            FROM live_edges e
+            JOIN frames f ON e.observer = f.token
+            WHERE e.predicate NOT IN (
+                'outcome', 'valuation', 'board-string', 'move-chosen',
+                'speaks-as', 'speaks-for', 'ran', 'enters'
+            )
+            ORDER BY e.created_at DESC
+        """)
+        edges = cur.fetchall()
+
+    # Build co-occurrence index: term → set of edge indices that contain it
+    term_to_edges = {}
+    for i_edge, (s, p, o, c, ph, w, n) in enumerate(edges):
+        for term in (s, p, o):
+            if term not in term_to_edges:
+                term_to_edges[term] = set()
+            term_to_edges[term].add(i_edge)
+
+    # Find truth-adjacent edges (share a term with any truth)
+    truth_adjacent = set()
+    for term in truth_terms:
+        truth_adjacent.update(term_to_edges.get(term, set()))
+
+    # Build second-order term set: terms that appear in truth-adjacent edges
+    second_order_terms = Counter()
+    for idx in truth_adjacent:
+        s, p, o = edges[idx][0], edges[idx][1], edges[idx][2]
+        for term in (s, p, o):
+            if term not in truth_terms:
+                second_order_terms[term] += 1
+
+    # Get parallax data
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT subject, predicate, object, spread
+            FROM parallax WHERE spread > 0
+        """)
+        parallax_map = {}
+        for s, p, o, spread in cur.fetchall():
+            parallax_map[(s, p, o)] = spread
+
+    conn.close()
+
+    # Phase weights
+    phase_w = {"salt": 1.5, "fluid": 1.0, "volatile": 0.7}
+
+    # Score each edge
+    scored = []
+    for s, p, o, c, ph, w, n in edges:
+        edge_terms = {s, p, o}
+
+        # 1. Direct term overlap with truths
+        direct = len(edge_terms & truth_terms)
+        if direct == 0 and not any(t in second_order_terms for t in edge_terms):
+            continue  # skip edges with zero relevance
+
+        # 2. Second-order relevance (co-occurrence with truth-adjacent edges)
+        second = sum(second_order_terms.get(t, 0) for t in edge_terms) / max(len(second_order_terms), 1)
+
+        # 3. Phase weight
+        pw = phase_w.get(ph, 1.0)
+
+        # 4. Parallax boost
+        spread = parallax_map.get((s, p, o), 0)
+        parallax_boost = 1 + spread * 2  # disagreement amplifies attention
+
+        # Combined score
+        score = (direct * 3.0 + second * 1.0) * pw * parallax_boost * c
+
+        scored.append((score, s, p, o, c, ph, w, n, direct))
+
+    scored.sort(key=lambda x: -x[0])
+
+    if do_parallax and len(truths) > 1:
+        # Per-truth attention fields, then show divergence
+        per_truth = {}
+        for ts, tp, to_ in truths:
+            truth_label = f"({ts} --{tp}--> {to_})"
+            t_terms = {ts, tp, to_} - {None}
+
+            # Score edges for just this truth
+            t_adjacent = set()
+            for term in t_terms:
+                t_adjacent.update(term_to_edges.get(term, set()))
+
+            t_second = Counter()
+            for idx in t_adjacent:
+                for term in (edges[idx][0], edges[idx][1], edges[idx][2]):
+                    if term not in t_terms:
+                        t_second[term] += 1
+
+            t_scored = {}
+            for s, p, o, c, ph, w, n in edges:
+                edge_terms = {s, p, o}
+                direct = len(edge_terms & t_terms)
+                second = sum(t_second.get(t, 0) for t in edge_terms) / max(len(t_second), 1)
+                if direct == 0 and second == 0:
+                    continue
+                pw = phase_w.get(ph, 1.0)
+                t_scored[(s, p, o)] = (direct * 3.0 + second) * pw * c
+
+            per_truth[truth_label] = t_scored
+
+        # Find edges where truths disagree most
+        all_keys = set()
+        for t_scored in per_truth.values():
+            all_keys.update(t_scored.keys())
+
+        divergences = []
+        labels = list(per_truth.keys())
+        for key in all_keys:
+            scores = [per_truth[l].get(key, 0) for l in labels]
+            if max(scores) < 0.01:
+                continue
+            # Normalize to make comparable
+            mx = max(scores)
+            norm = [s / mx for s in scores]
+            divergence = max(norm) - min(norm)
+            divergences.append((divergence, key, scores))
+
+        divergences.sort(key=lambda x: -x[0])
+
+        print(f"\n  ATTENTION PARALLAX — where your truths disagree")
+        print(f"  truths: {', '.join(labels)}")
+        print(f"  {'─' * 70}\n")
+
+        for div, (s, p, o), scores in divergences[:limit]:
+            score_str = "  ".join(f"{sc:.2f}" for sc in scores)
+            print(f"  [{div:.2f}] ({s} --{p}--> {o})")
+            print(f"         scores: {score_str}")
+
+    else:
+        # Standard attention output
+        print(f"\n  ATTENTION — from {len(truth_terms)} truth terms")
+        print(f"  terms: {', '.join(sorted(truth_terms))}")
+        print(f"  {'─' * 70}\n")
+
+        for score, s, p, o, c, ph, w, n, direct in scored[:limit]:
+            marker = "●" * direct + "○" * (3 - direct)
+            note_preview = f"  {n[:60]}..." if n and len(n) > 60 else f"  {n}" if n else ""
+            print(f"  [{score:.2f}] {marker} ({s} --{p}--> {o}) [{ph}, @{w}]{note_preview}")
+
+    print()
+
+
+def cmd_polarity(args):
+    """Predicate polarity: discover directional relationships between predicates.
+
+    Two predicates are ALIGNED if they co-occur on the same (subject, object) pairs.
+    They are ANTI-ALIGNED if they co-occur with subject↔object swapped.
+
+    This reveals the graph's implicit type system: which predicates flow together,
+    which flow against each other, and which are orthogonal.
+    """
+    from collections import Counter, defaultdict
+
+    limit = 20
+    pred_filter = None
+    i = 0
+    while i < len(args):
+        if args[i] == "--limit" and i + 1 < len(args):
+            limit = int(args[i + 1]); i += 2
+        elif not args[i].startswith("--"):
+            pred_filter = args[i]; i += 1
+        else:
+            i += 1
+
+    conn = connect()
+
+    # Fetch all knowledge edges
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT subject, predicate, object FROM live_edges
+            WHERE predicate NOT IN (
+                'outcome', 'valuation', 'board-string', 'move-chosen',
+                'speaks-as', 'speaks-for', 'ran', 'enters'
+            )
+        """)
+        edges = cur.fetchall()
+    conn.close()
+
+    # Build: for each (subject, object) pair, which predicates appear?
+    # And for each (object, subject) pair (reversed), which predicates appear?
+    pair_preds = defaultdict(set)       # (s, o) → {predicates}
+    pred_subjects = defaultdict(set)    # predicate → {subjects}
+    pred_objects = defaultdict(set)     # predicate → {objects}
+
+    for s, p, o in edges:
+        pair_preds[(s, o)].add(p)
+        pred_subjects[p].add(s)
+        pred_objects[p].add(o)
+
+    # Count co-occurrences between predicate pairs
+    # same_dir: both appear on same (s, o) pair
+    # reversed: p1 appears on (s, o) and p2 appears on (o, s)
+    same_dir = Counter()
+    reversed_dir = Counter()
+
+    all_preds = sorted(pred_subjects.keys())
+
+    for (s, o), preds in pair_preds.items():
+        preds_list = sorted(preds)
+        # Same direction: both predicates on same (s, o)
+        for i_p in range(len(preds_list)):
+            for j_p in range(i_p + 1, len(preds_list)):
+                pair = (preds_list[i_p], preds_list[j_p])
+                same_dir[pair] += 1
+
+        # Reversed: predicates on (s, o) vs predicates on (o, s)
+        rev_preds = pair_preds.get((o, s), set())
+        for p1 in preds:
+            for p2 in rev_preds:
+                if p1 < p2:
+                    reversed_dir[(p1, p2)] += 1
+                elif p1 > p2:
+                    reversed_dir[(p2, p1)] += 1
+
+    # Also: subject overlap — predicates that share subjects flow from the same sources
+    # Object overlap — predicates that flow toward the same targets
+    subject_overlap = Counter()
+    object_overlap = Counter()
+
+    for i_p in range(len(all_preds)):
+        for j_p in range(i_p + 1, len(all_preds)):
+            p1, p2 = all_preds[i_p], all_preds[j_p]
+            s_overlap = len(pred_subjects[p1] & pred_subjects[p2])
+            o_overlap = len(pred_objects[p1] & pred_objects[p2])
+            if s_overlap > 0:
+                subject_overlap[(p1, p2)] = s_overlap
+            if o_overlap > 0:
+                object_overlap[(p1, p2)] = o_overlap
+
+    if pred_filter:
+        # Show polarity for one predicate against all others
+        print(f"\n  POLARITY of '{pred_filter}'")
+        print(f"  subjects: {len(pred_subjects.get(pred_filter, set()))}")
+        print(f"  objects:  {len(pred_objects.get(pred_filter, set()))}")
+        print(f"  {'─' * 70}\n")
+
+        relations = []
+        for p in all_preds:
+            if p == pred_filter:
+                continue
+            pair = tuple(sorted([pred_filter, p]))
+            sd = same_dir.get(pair, 0)
+            rv = reversed_dir.get(pair, 0)
+            so = subject_overlap.get(pair, 0)
+            oo = object_overlap.get(pair, 0)
+            total = sd + rv + so + oo
+            if total == 0:
+                continue
+            # Polarity: positive = aligned, negative = anti-aligned
+            polarity = (sd + so - rv) / max(sd + rv + so, 1)
+            relations.append((polarity, p, sd, rv, so, oo, total))
+
+        relations.sort(key=lambda x: -x[-1])  # by total signal
+
+        print(f"  {'predicate':<30} {'pol':>5} {'same':>5} {'rev':>5} {'subj':>5} {'obj':>5}")
+        print(f"  {'─' * 65}")
+        for pol, p, sd, rv, so, oo, total in relations[:limit]:
+            arrow = "→→" if pol > 0.3 else "←→" if pol < -0.3 else "──"
+            print(f"  {p:<30} {pol:>+.2f} {sd:>5} {rv:>5} {so:>5} {oo:>5}  {arrow}")
+
+    else:
+        # Show strongest polarities across all predicate pairs
+        print(f"\n  PREDICATE POLARITY — {len(all_preds)} predicates, {len(edges)} edges")
+        print(f"  {'─' * 70}\n")
+
+        all_pairs = set()
+        all_pairs.update(same_dir.keys())
+        all_pairs.update(reversed_dir.keys())
+        all_pairs.update(subject_overlap.keys())
+        all_pairs.update(object_overlap.keys())
+
+        scored = []
+        for pair in all_pairs:
+            sd = same_dir.get(pair, 0)
+            rv = reversed_dir.get(pair, 0)
+            so = subject_overlap.get(pair, 0)
+            oo = object_overlap.get(pair, 0)
+            total = sd + rv + so + oo
+            if total < 2:
+                continue  # need minimum signal
+            polarity = (sd + so - rv) / max(sd + rv + so, 1)
+            scored.append((abs(polarity), polarity, pair[0], pair[1], sd, rv, so, oo, total))
+
+        scored.sort(key=lambda x: (-x[0], -x[-1]))
+
+        # Show strongest aligned
+        aligned = [s for s in scored if s[1] > 0.3]
+        anti = [s for s in scored if s[1] < -0.3]
+        neutral = [s for s in scored if -0.3 <= s[1] <= 0.3 and s[-1] >= 3]
+
+        if aligned:
+            print(f"  ALIGNED (flow same direction):")
+            for _, pol, p1, p2, sd, rv, so, oo, total in aligned[:limit // 3]:
+                print(f"    {p1} →→ {p2}  (pol={pol:+.2f}, n={total})")
+
+        if anti:
+            print(f"\n  ANTI-ALIGNED (flow opposite):")
+            for _, pol, p1, p2, sd, rv, so, oo, total in anti[:limit // 3]:
+                print(f"    {p1} ←→ {p2}  (pol={pol:+.2f}, n={total})")
+
+        if neutral:
+            print(f"\n  ORTHOGONAL (co-occur but no directional bias):")
+            for _, pol, p1, p2, sd, rv, so, oo, total in neutral[:limit // 3]:
+                print(f"    {p1} ── {p2}  (pol={pol:+.2f}, n={total})")
+
+    print()
+
+
 def cmd_help(args):
     print("Establish a reference frame:")
     print("  edge iam <who>                         start a frame")
@@ -743,6 +1102,8 @@ def cmd_help(args):
     print("  edge ran <movement>                    register run + show prior deposits")
     print("  edge digest [--limit N] [--min-spread F] [--who 'name'] [--dry-run]")
     print("  edge isomorph [--limit N] [--min-jaccard F] [--who 'name'] [--dry-run]")
+    print("  edge attend [--parallax] [--limit N]    subjective attention from truths")
+    print("  edge polarity [predicate] [--limit N]  predicate directional alignment")
     print("  edge orient [days]                     orientation map (default 7d)")
     print("  edge starmap                           nearby graph from truths → .edge/starmap")
 
@@ -771,6 +1132,8 @@ COMMANDS = {
     "raw": cmd_raw,
     "digest": cmd_digest,
     "isomorph": cmd_isomorph,
+    "attend": cmd_attend,
+    "polarity": cmd_polarity,
     "help": cmd_help,
     "-h": cmd_help,
     "--help": cmd_help,
