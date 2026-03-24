@@ -702,7 +702,12 @@ def edge_garden(limit: int = 20) -> str:
         cur.execute("""
             SELECT e.subject, e.predicate, e.object, e.confidence, e.phase, f.who, e.hash
             FROM live_edges e JOIN frames f ON e.observer = f.token
-            WHERE length(e.subject) > 50 OR length(e.object) > 50
+            WHERE (length(e.subject) > 50 OR length(e.object) > 50)
+            AND NOT EXISTS (
+                SELECT 1 FROM live_edges d
+                WHERE d.predicate = 'decomposed-into'
+                AND d.subject = 'e:' || e.subject || '/' || e.predicate || '/' || e.object
+            )
             ORDER BY greatest(length(e.subject), length(e.object)) DESC
             LIMIT %s
         """, (limit,))
@@ -748,6 +753,36 @@ def edge_name(ref: str, slug: str) -> str:
         s, p, o, h = row
         return f"named: ({s} --{p}--> {o}) #{h} → slug:{slug}"
     return f"error: no live edge with hash/slug '{ref}'"
+
+
+@mcp.tool()
+def edge_decompose(ref: str, parts: list[str]) -> str:
+    """Decompose a long edge into cleaner parts. ref is hash or slug. parts is a flat list: [s1, p1, o1, s2, p2, o2, ...]."""
+    if len(parts) < 3 or len(parts) % 3 != 0:
+        return "error: parts must be groups of 3 (subject, predicate, object)"
+
+    frame = _load_frame()
+    if not frame or not frame.ready:
+        return "No active frame. Call edge_iam + edge_true (x3) first."
+
+    g = Graph(frame)
+    original = g.resolve_slug(ref)
+    if original is None:
+        return f"error: no live edge with hash/slug '{ref}'"
+
+    original_ref = f"e:{original.subject}/{original.predicate}/{original.object}"
+    lines = []
+
+    for i in range(0, len(parts), 3):
+        s, p, o = parts[i], parts[i + 1], parts[i + 2]
+        edge = g.add(s, p, o, phase=original.phase)
+        lines.append(f"+ {_fmt_edge(edge)}  #{edge.hash}")
+        part_ref = f"{s}/{p}/{o}"
+        link = g.add(original_ref, "decomposed-into", part_ref)
+        lines.append(f"~ {_fmt_edge(link)}")
+
+    lines.append(f"\ndecomposed #{original.hash or ref} into {len(parts) // 3} part(s)")
+    return "\n".join(lines)
 
 
 @mcp.tool()

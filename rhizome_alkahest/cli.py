@@ -1219,11 +1219,16 @@ def cmd_garden(args):
 
     conn = connect()
     with conn.cursor() as cur:
-        # Long edges — subject or object over 50 chars (likely compressed deposits)
+        # Long edges — subject or object over 50 chars, excluding already-decomposed
         cur.execute("""
             SELECT e.id, e.subject, e.predicate, e.object, e.confidence, e.phase, f.who, e.hash, e.slug
             FROM live_edges e JOIN frames f ON e.observer = f.token
-            WHERE length(e.subject) > 50 OR length(e.object) > 50
+            WHERE (length(e.subject) > 50 OR length(e.object) > 50)
+            AND NOT EXISTS (
+                SELECT 1 FROM live_edges d
+                WHERE d.predicate = 'decomposed-into'
+                AND d.subject = 'e:' || e.subject || '/' || e.predicate || '/' || e.object
+            )
             ORDER BY greatest(length(e.subject), length(e.object)) DESC
             LIMIT %s
         """, (limit,))
@@ -1284,6 +1289,67 @@ def cmd_name(args):
     else:
         print(f"  error: no live edge with hash/slug '{ref}'")
         sys.exit(1)
+
+
+def cmd_decompose(args):
+    """Decompose a long edge into parts. Parts are new edges; the original gets a decomposed-into link.
+
+    usage: edge decompose <hash-or-slug> <s1> <p1> <o1> [<s2> <p2> <o2> ...]
+    Each group of 3 args is a new edge (subject, predicate, object).
+    """
+    if len(args) < 4:
+        print("usage: edge decompose <hash> <s> <p> <o> [<s> <p> <o> ...]")
+        print("  each triple is a new edge decomposed from the original")
+        sys.exit(1)
+
+    ref = args[0]
+    triples_raw = args[1:]
+    if len(triples_raw) % 3 != 0:
+        print("  error: parts must be groups of 3 (subject predicate object)")
+        sys.exit(1)
+
+    frame = _require_frame()
+    g = Graph(frame)
+
+    # Resolve the original
+    original = g.resolve_slug(ref)
+    if original is None:
+        # Try as e: prefix too
+        conn = connect()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, subject, predicate, object, confidence, phase, observer, notes, created_at, slug, hash
+                FROM live_edges WHERE hash = %s OR slug = %s LIMIT 1
+            """, (ref, ref))
+            row = cur.fetchone()
+        conn.close()
+        if row:
+            original = Edge(
+                id=str(row[0]), subject=row[1], predicate=row[2], object=row[3],
+                confidence=row[4], phase=row[5], observer=row[6], notes=row[7],
+                created_at=row[8], slug=row[9], hash=row[10],
+            )
+        else:
+            print(f"  error: no live edge with hash/slug '{ref}'")
+            sys.exit(1)
+
+    original_ref = f"e:{original.subject}/{original.predicate}/{original.object}"
+
+    # Create the decomposed parts
+    parts = []
+    for i in range(0, len(triples_raw), 3):
+        s, p, o = triples_raw[i], triples_raw[i + 1], triples_raw[i + 2]
+        edge = g.add(s, p, o, phase=original.phase)
+        parts.append(edge)
+        print(f"  + {_fmt_edge(edge)}  #{edge.hash}")
+
+    # Link original → decomposed-into each part
+    for part in parts:
+        part_ref = f"{part.subject}/{part.predicate}/{part.object}"
+        link = g.add(original_ref, "decomposed-into", part_ref)
+        print(f"  ~ {_fmt_edge(link)}")
+
+    print(f"\n  decomposed #{original.hash or ref} into {len(parts)} part(s)")
 
 
 def cmd_words(args):
@@ -1362,6 +1428,7 @@ COMMANDS = {
     "polarity": cmd_polarity,
     "garden": cmd_garden,
     "name": cmd_name,
+    "decompose": cmd_decompose,
     "words": cmd_words,
     "help": cmd_help,
     "-h": cmd_help,
