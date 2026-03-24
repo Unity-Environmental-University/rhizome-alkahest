@@ -36,6 +36,22 @@ edge true the_gap is_where hyphae_go
 # Record edges
 edge add unsaying is_same_structure_as wave_collapse
 edge add tolkien learned finnish --confidence 0.9 --note "Exeter College library, 1912"
+edge add tolkien learned finnish --slug tolkien-finnish   # name it
+
+# Edge-as-subject — reference by slug, hash, or triple
+edge add e[tolkien-finnish] illustrates dedication         # by slug
+edge add e[a3f2c9b1] illustrates dedication                # by hash
+edge add e[tolkien learned finnish] illustrates dedication  # by triple
+
+# Agglutinative grammar — edge say
+edge say shear is zpd-boundary:glows-because:apophasis     # : chains nodes
+edge say hallie builds rooms~obs                            # ~ marks evidentiality
+edge say hallie builds rooms~because:care:drives:design     # ~ links edges
+
+# Aliases for common predicates
+edge alias gb glows-because       # create
+edge alias                        # list all
+edge say shear is boundary:gb:apophasis   # use in say
 
 # Query (no frame required)
 edge about hallie          # edges from this subject
@@ -49,11 +65,52 @@ edge ls salt               # just precipitated ones
 edge count                 # summary
 edge dissolve x is y       # soft-delete
 
+# Stewardship
+edge garden                # surface edges needing tending
+edge name <hash> <slug>    # retroactively name an edge
+edge decompose <hash> s p o [s p o ...]   # break long edge into parts
+edge words                 # vocabulary frequency
+edge words predicates      # just predicates
+
 # Navigate
 edge orient [days]         # orientation map (default 7d)
 edge starmap               # nearby graph from truths → .edge/starmap
 edge ran <movement>        # register a qigong run + show prior deposits
 ```
+
+## Slugs, hashes, and edge-as-subject
+
+Every edge gets an auto-generated 8-char content hash (`#a3f2c9b1`).
+Edges can also be given a human-friendly slug (`--slug my-name`).
+Both are printed on creation and can be used to reference the edge
+as the subject of another edge via `e[slug-or-hash]` notation.
+
+`e[s p o]` resolves by triple content (no slug/hash needed).
+
+The canonical form for an edge-as-subject is `e:subject/predicate/object`.
+
+## Agglutinative grammar
+
+`edge say` parses sentences where `:` and `~` suffixes generate edges.
+Grammar predicates (which words trigger splits) come from the graph
+itself — any predicate with >= 5 uses becomes a structural word.
+
+- `:pred:value` — node chain. Object becomes next subject.
+- `~marker` — bare evidentiality tag on the edge.
+- `~pred:value` — edge annotation (edge → value).
+- `~pred:s:p:o` — edge-to-edge link (clause → clause).
+
+Aliases (`edge alias bc because`) map short forms to full predicates.
+Aliases are edges themselves: `(bc --is-alias-for--> because)`.
+
+## Stewardship
+
+- `edge garden` — surfaces long edges and unnamed salt.
+  Filters out edges already decomposed.
+- `edge name` — retroactively slug an edge by hash.
+- `edge decompose` — break a long edge into parts, linked by
+  `decomposed-into` edges back to the original.
+- `edge words` — vocabulary frequency across positions.
 
 ## Phase dissolution
 
@@ -74,7 +131,7 @@ The parallax between frames is data, not noise.
 ## Schema
 
 - `frames` — reference frames (token, who, cwd, truths, context)
-- `edges` — the atoms (s, p, o, confidence, phase, observer, notes, positionality, embedding)
+- `edges` — the atoms (s, p, o, confidence, phase, observer, notes, positionality, embedding, slug, hash)
 - `steps` — otter loop history
 - `sessions` — conversation provenance
 - `live_edges` — view: undissolved edges only
