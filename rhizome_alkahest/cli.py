@@ -602,7 +602,7 @@ def _starmap_inner(quiet=False):
                 JOIN frames f ON e.observer = f.token
                 WHERE (e.subject = %s OR e.object = %s)
                   AND e.subject != 'this-session'
-                  AND e.predicate NOT IN ('ran', 'enters')
+                  AND e.predicate NOT IN ('ran', 'enters', 'speaks-as', 'speaks-for')
                 ORDER BY e.created_at DESC LIMIT 8
             """, (term, term))
             edges = cur.fetchall()
@@ -612,6 +612,70 @@ def _starmap_inner(quiet=False):
             for edge_str, phase, edge_who in edges:
                 lines.append(f"- `{phase}` {edge_str} [{edge_who}]")
             lines.append("")
+
+    # Attention section: top-5 edges by attention score
+    lines.append("## Attention")
+    lines.append("*Edges most relevant to current truths (by term overlap × phase × parallax)*")
+    lines.append("")
+
+    truth_terms_set = set(terms)
+    SKIP_PREDS = ('outcome', 'valuation', 'board-string', 'move-chosen',
+                  'speaks-as', 'speaks-for', 'ran', 'enters')
+
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT e.subject, e.predicate, e.object, e.confidence, e.phase, e.notes
+            FROM live_edges e
+            WHERE e.predicate != ALL(%s)
+            ORDER BY e.created_at DESC
+        """, (list(SKIP_PREDS),))
+        att_edges = cur.fetchall()
+
+    # Build co-occurrence for second-order relevance
+    from collections import Counter
+    att_term_idx = {}
+    for i_e, (s, p, o, c, ph, n) in enumerate(att_edges):
+        for t in (s, p, o):
+            if t not in att_term_idx:
+                att_term_idx[t] = set()
+            att_term_idx[t].add(i_e)
+
+    att_adjacent = set()
+    for t in truth_terms_set:
+        att_adjacent.update(att_term_idx.get(t, set()))
+
+    second_order = Counter()
+    for idx in att_adjacent:
+        for t in (att_edges[idx][0], att_edges[idx][1], att_edges[idx][2]):
+            if t not in truth_terms_set:
+                second_order[t] += 1
+
+    # Get parallax
+    with conn.cursor() as cur:
+        cur.execute("SELECT subject, predicate, object, spread FROM parallax WHERE spread > 0")
+        par_map = {(s, p, o): sp for s, p, o, sp in cur.fetchall()}
+
+    phase_w = {"salt": 1.5, "fluid": 1.0, "volatile": 0.7}
+    att_scored = []
+    for s, p, o, c, ph, n in att_edges:
+        edge_terms = {s, p, o}
+        direct = len(edge_terms & truth_terms_set)
+        second = sum(second_order.get(t, 0) for t in edge_terms) / max(len(second_order), 1)
+        if direct == 0 and second == 0:
+            continue
+        pw = phase_w.get(ph, 1.0)
+        spread = par_map.get((s, p, o), 0)
+        score = (direct * 3.0 + second) * pw * (1 + spread * 2) * c
+        att_scored.append((score, s, p, o, ph, n))
+
+    att_scored.sort(key=lambda x: -x[0])
+    for score, s, p, o, ph, n in att_scored[:5]:
+        note_str = f" — {n[:70]}" if n else ""
+        lines.append(f"- [{score:.1f}] `{ph}` ({s} --{p}--> {o}){note_str}")
+
+    if not att_scored:
+        lines.append("- (no edges with attention signal)")
+    lines.append("")
 
     lines.append("## Recent deposits")
     with conn.cursor() as cur:
