@@ -1417,8 +1417,11 @@ def cmd_words(args):
 #
 # The grammar (which predicates act as suffixes) comes from the graph itself.
 
-def _load_grammar(conn, min_uses: int = 5) -> set[str]:
-    """Load the graph's own grammar: predicates used often enough to be particles."""
+def _load_grammar(conn, min_uses: int = 5) -> tuple[set[str], dict[str, str]]:
+    """Load the graph's grammar and aliases.
+
+    Returns (predicates, aliases) where aliases maps short → full predicate.
+    """
     with conn.cursor() as cur:
         cur.execute("""
             SELECT predicate, count(*) AS n
@@ -1428,24 +1431,42 @@ def _load_grammar(conn, min_uses: int = 5) -> set[str]:
             HAVING count(*) >= %s
             ORDER BY n DESC
         """, (min_uses,))
-        return {row[0] for row in cur.fetchall()}
+        predicates = {row[0] for row in cur.fetchall()}
+
+        # Load aliases: (abbrev --is-alias-for--> full-predicate)
+        cur.execute("""
+            SELECT subject, object FROM live_edges
+            WHERE predicate = 'is-alias-for'
+        """)
+        aliases = {row[0]: row[1] for row in cur.fetchall()}
+
+    # Aliases expand the grammar — the alias itself becomes a valid particle
+    for abbrev, full in aliases.items():
+        if full in predicates:
+            predicates.add(abbrev)
+
+    return predicates, aliases
 
 
-def _expand_agglutination(token: str, grammar: set[str]) -> tuple[str, list[tuple[str, str]], list[tuple[str, list[str]]]]:
+def _expand_agglutination(token: str, grammar: set[str], aliases: dict[str, str] | None = None) -> tuple[str, list[tuple[str, str]], list[tuple[str, list[str]]]]:
     """Expand a token with : and ~ suffixes.
 
     Returns (root, chains, annotations) where:
       chains = [(predicate, object), ...] — node-to-node via :
       annotations = [(predicate, [clause_words...]), ...] — edge-to-edge via ~
     """
+    aliases = aliases or {}
+
+    def _resolve(pred: str) -> str:
+        return aliases.get(pred, pred)
+
     # Split ~ annotations first
     tilde_parts = token.split("~")
     main_part = tilde_parts[0]
     annotations = []
     for ann in tilde_parts[1:]:
-        # annotation might have : inside it for a full clause: ~because:inhabitation:drives:design
         ann_colon = ann.split(":")
-        annotations.append((ann_colon[0], ann_colon[1:]))
+        annotations.append((_resolve(ann_colon[0]), ann_colon[1:]))
 
     # Split : chains
     colon_parts = main_part.split(":")
@@ -1456,10 +1477,9 @@ def _expand_agglutination(token: str, grammar: set[str]) -> tuple[str, list[tupl
     while i < len(colon_parts):
         pred = colon_parts[i]
         if pred in grammar and i + 1 < len(colon_parts):
-            chains.append((pred, colon_parts[i + 1]))
+            chains.append((_resolve(pred), colon_parts[i + 1]))
             i += 2
         else:
-            # Not a known predicate — treat as part of the root
             root = root + ":" + pred
             i += 1
 
@@ -1485,7 +1505,7 @@ def cmd_say(args):
         sys.exit(1)
 
     conn = connect()
-    grammar = _load_grammar(conn)
+    grammar, aliases = _load_grammar(conn)
     conn.close()
 
     # Parse into triples: every 3 space-separated tokens is a triple,
@@ -1503,10 +1523,12 @@ def cmd_say(args):
 
     if dry:
         print(f"  grammar ({len(grammar)}): {', '.join(sorted(grammar)[:20])}...")
+        if aliases:
+            print(f"  aliases: {', '.join(f'{k}→{v}' for k, v in sorted(aliases.items()))}")
         print()
         for s, p, o in triples:
-            s_root, s_chains, s_anns = _expand_agglutination(s, grammar)
-            o_root, o_chains, o_anns = _expand_agglutination(o, grammar)
+            s_root, s_chains, s_anns = _expand_agglutination(s, grammar, aliases)
+            o_root, o_chains, o_anns = _expand_agglutination(o, grammar, aliases)
             print(f"  ({s_root} --{p}--> {o_root})")
             for cp, co in o_chains:
                 prev = o_root if not o_chains[:1] else o_root
@@ -1562,6 +1584,64 @@ def cmd_say(args):
                 print(f"    ~ ({base_ref} --evidentiality--> {ap})  #{link.hash}")
 
 
+def cmd_alias(args):
+    """Create or list predicate aliases for edge say.
+
+    edge alias bc because          — create alias
+    edge alias                     — list all aliases
+    edge alias --rm bc             — remove alias
+    """
+    if not args:
+        # List aliases
+        conn = connect()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT subject, object FROM live_edges
+                WHERE predicate = 'is-alias-for'
+                ORDER BY subject
+            """)
+            rows = cur.fetchall()
+        conn.close()
+        if not rows:
+            print("  no aliases. create with: edge alias <short> <predicate>")
+        else:
+            for abbrev, full in rows:
+                print(f"  {abbrev} → {full}")
+        return
+
+    if args[0] == "--rm" and len(args) >= 2:
+        frame = _require_frame()
+        g = Graph(frame)
+        n = g.dissolve(args[1], "is-alias-for", "%")
+        # dissolve needs exact match — query first
+        conn = connect()
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE edges SET dissolved_at = now()
+                WHERE subject = %s AND predicate = 'is-alias-for' AND dissolved_at IS NULL
+                RETURNING object
+            """, (args[1],))
+            row = cur.fetchone()
+        conn.commit()
+        conn.close()
+        if row:
+            print(f"  removed: {args[1]} → {row[0]}")
+        else:
+            print(f"  no alias '{args[1]}' found")
+        return
+
+    if len(args) < 2:
+        print("usage: edge alias <short> <predicate>")
+        sys.exit(1)
+
+    abbrev, full = args[0], args[1]
+    frame = _require_frame()
+    g = Graph(frame)
+    edge = g.add(abbrev, "is-alias-for", full, confidence=1.0, phase="salt")
+    print(f"  + {abbrev} → {full}")
+    print(f"    now usable in edge say: ::{abbrev}::value")
+
+
 # ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
@@ -1593,6 +1673,7 @@ COMMANDS = {
     "decompose": cmd_decompose,
     "words": cmd_words,
     "say": cmd_say,
+    "alias": cmd_alias,
     "help": cmd_help,
     "-h": cmd_help,
     "--help": cmd_help,
