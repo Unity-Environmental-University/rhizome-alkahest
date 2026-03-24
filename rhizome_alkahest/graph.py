@@ -1,5 +1,6 @@
 """Graph — the interface to the knowledge graph."""
 
+import hashlib
 import json
 from typing import Optional
 
@@ -9,6 +10,12 @@ from .db import connect
 from .edge import Edge
 from .frame import Frame
 from .frame_pointer import git_context
+
+
+def edge_hash(subject: str, predicate: str, object: str, observer: str) -> str:
+    """Deterministic 8-char hash for an edge triple + observer."""
+    content = f"{subject}\0{predicate}\0{object}\0{observer}"
+    return hashlib.sha256(content.encode()).hexdigest()[:8]
 
 
 class Graph:
@@ -28,16 +35,18 @@ class Graph:
         confidence: float = 0.7,
         phase: str = "fluid",
         notes: str = "",
+        slug: str | None = None,
     ) -> Edge:
         """Record an edge from this frame's position."""
         pos = json.dumps(git_context())
+        ehash = edge_hash(subject, predicate, object, self.frame.token)
         with self.conn.cursor() as cur:
             cur.execute(
-                """INSERT INTO edges (subject, predicate, object, confidence, phase, observer, notes, positionality)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """INSERT INTO edges (subject, predicate, object, confidence, phase, observer, notes, positionality, slug, hash)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                    ON CONFLICT DO NOTHING
                    RETURNING id, created_at""",
-                (subject, predicate, object, confidence, phase, self.frame.token, notes, pos),
+                (subject, predicate, object, confidence, phase, self.frame.token, notes, pos, slug, ehash),
             )
             row = cur.fetchone()
         self.conn.commit()
@@ -50,10 +59,28 @@ class Graph:
             phase=phase,
             observer=self.frame.token,
             notes=notes,
+            slug=slug,
+            hash=ehash,
         )
         if row:
             edge.id, edge.created_at = row
         return edge
+
+    def resolve_slug(self, slug: str) -> Edge | None:
+        """Look up a live edge by slug or hash."""
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, subject, predicate, object, confidence, phase, observer, notes, created_at, slug, hash
+                   FROM live_edges WHERE slug = %s OR hash = %s LIMIT 1""",
+                (slug, slug),
+            )
+            row = cur.fetchone()
+            if row:
+                e = self._row_to_edge(row[:9])
+                e.slug = row[9]
+                e.hash = row[10]
+                return e
+            return None
 
     def about(self, subject: str) -> list[Edge]:
         """All living edges with this subject."""

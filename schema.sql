@@ -47,7 +47,9 @@ CREATE TABLE edges (
     notes           TEXT DEFAULT '',
     positionality   JSONB NOT NULL DEFAULT '{}',
     dissolved_at    TIMESTAMPTZ,
-    embedding       vector(384)
+    embedding       vector(384),
+    slug            TEXT,
+    hash            TEXT
 );
 
 -- Same triple, same observer = one living edge
@@ -60,6 +62,12 @@ CREATE INDEX idx_edges_predicate ON edges (predicate) WHERE dissolved_at IS NULL
 CREATE INDEX idx_edges_phase ON edges (phase) WHERE dissolved_at IS NULL;
 CREATE INDEX idx_edges_session ON edges (session_id) WHERE dissolved_at IS NULL;
 CREATE INDEX idx_edges_observer ON edges (observer) WHERE dissolved_at IS NULL;
+CREATE UNIQUE INDEX idx_edges_slug ON edges (slug)
+    WHERE slug IS NOT NULL AND dissolved_at IS NULL;
+
+CREATE UNIQUE INDEX idx_edges_hash ON edges (hash)
+    WHERE hash IS NOT NULL AND dissolved_at IS NULL;
+
 CREATE INDEX idx_edges_embedding ON edges
     USING ivfflat (embedding vector_cosine_ops)
     WITH (lists = 10);

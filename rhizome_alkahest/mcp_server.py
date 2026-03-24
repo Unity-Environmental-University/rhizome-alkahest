@@ -192,8 +192,9 @@ def edge_add(
     confidence: float = 0.7,
     phase: str = "fluid",
     note: str = "",
+    slug: str = "",
 ) -> str:
-    """Record an edge from the current frame."""
+    """Record an edge from the current frame. Use --slug to name it. Use e[slug] as subject to reference another edge."""
     frame = _load_frame()
     if not frame:
         return "No frame. Call edge_iam first."
@@ -201,8 +202,19 @@ def edge_add(
         return f"Frame incomplete ({len(frame.truths)}/3 truths). Call edge_true."
 
     g = Graph(frame)
-    edge = g.add(subject, predicate, object, confidence, phase, note)
+    # Resolve e[slug] notation
+    if subject.startswith("e[") and subject.endswith("]"):
+        ref_slug = subject[2:-1]
+        ref = g.resolve_slug(ref_slug)
+        if ref is None:
+            return f"error: no live edge with slug '{ref_slug}'"
+        subject = f"e:{ref.subject}/{ref.predicate}/{ref.object}"
+
+    edge = g.add(subject, predicate, object, confidence, phase, note, slug=slug or None)
     result = f"+ {_fmt_edge(edge)}"
+    result += f"\n  #{edge.hash}"
+    if slug:
+        result += f"\n  slug: {slug}"
     if note:
         result += f"\n  note: {note}"
     return result

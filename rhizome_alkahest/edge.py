@@ -16,6 +16,8 @@ class Edge:
     notes: str = ""
     id: Optional[str] = None
     created_at: Optional[datetime] = None
+    slug: Optional[str] = None
+    hash: Optional[str] = None
 
     @property
     def triple(self) -> tuple[str, str, str]:
