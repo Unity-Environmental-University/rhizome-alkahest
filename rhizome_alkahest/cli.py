@@ -1639,7 +1639,7 @@ def cmd_alias(args):
     g = Graph(frame)
     edge = g.add(abbrev, "is-alias-for", full, confidence=1.0, phase="salt")
     print(f"  + {abbrev} → {full}")
-    print(f"    now usable in edge say: ::{abbrev}::value")
+    print(f"    now usable in edge say: :{abbrev}:value")
 
 
 # ---------------------------------------------------------------------------
