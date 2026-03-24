@@ -693,6 +693,90 @@ def thread_new(slug: str, title: str = "") -> str:
     return f"thread created: {slug}\ntitle: {label}\nuse: thread_reply('{slug}', body)"
 
 
+@mcp.tool()
+def edge_garden(limit: int = 20) -> str:
+    """Surface edges that need tending: long terms, unnamed salt, etc."""
+    conn = connect()
+    lines = []
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT e.subject, e.predicate, e.object, e.confidence, e.phase, f.who, e.hash
+            FROM live_edges e JOIN frames f ON e.observer = f.token
+            WHERE length(e.subject) > 50 OR length(e.object) > 50
+            ORDER BY greatest(length(e.subject), length(e.object)) DESC
+            LIMIT %s
+        """, (limit,))
+        long_edges = cur.fetchall()
+
+        cur.execute("""
+            SELECT e.subject, e.predicate, e.object, e.confidence, f.who, e.hash
+            FROM live_edges e JOIN frames f ON e.observer = f.token
+            WHERE e.phase = 'salt' AND e.slug IS NULL
+            AND e.predicate NOT IN ('speaks-as', 'speaks-for')
+            ORDER BY e.confidence DESC
+            LIMIT %s
+        """, (limit,))
+        unnamed_salt = cur.fetchall()
+    conn.close()
+
+    if long_edges:
+        lines.append(f"=== long edges ({len(long_edges)}) — may want decomposing ===")
+        for s, p, o, c, ph, w, h in long_edges:
+            longest = max(len(s), len(o))
+            lines.append(f"[{longest}ch] ({s} --{p}--> {o}) [{c:.2f}, {ph}, @{w}] #{h}")
+    if unnamed_salt:
+        lines.append(f"\n=== salt without slugs ({len(unnamed_salt)}) — worth naming? ===")
+        for s, p, o, c, w, h in unnamed_salt:
+            lines.append(f"({s} --{p}--> {o}) [{c:.2f}, @{w}] #{h}")
+    return "\n".join(lines) if lines else "garden is tidy"
+
+
+@mcp.tool()
+def edge_name(ref: str, slug: str) -> str:
+    """Give an existing edge a slug. ref can be a hash or existing slug."""
+    conn = connect()
+    with conn.cursor() as cur:
+        cur.execute("""
+            UPDATE edges SET slug = %s
+            WHERE (hash = %s OR slug = %s) AND dissolved_at IS NULL
+            RETURNING subject, predicate, object, hash
+        """, (slug, ref, ref))
+        row = cur.fetchone()
+    conn.commit()
+    conn.close()
+    if row:
+        s, p, o, h = row
+        return f"named: ({s} --{p}--> {o}) #{h} → slug:{slug}"
+    return f"error: no live edge with hash/slug '{ref}'"
+
+
+@mcp.tool()
+def edge_words(position: str = "predicates", limit: int = 30) -> str:
+    """Vocabulary frequency. position: all, subjects, predicates, objects."""
+    conn = connect()
+    with conn.cursor() as cur:
+        if position == "predicates":
+            cur.execute("SELECT predicate, count(*) FROM live_edges GROUP BY predicate ORDER BY count DESC LIMIT %s", (limit,))
+        elif position == "subjects":
+            cur.execute("SELECT subject, count(*) FROM live_edges GROUP BY subject ORDER BY count DESC LIMIT %s", (limit,))
+        elif position == "objects":
+            cur.execute("SELECT object, count(*) FROM live_edges GROUP BY object ORDER BY count DESC LIMIT %s", (limit,))
+        else:
+            cur.execute("""
+                SELECT term, count(*) FROM (
+                    SELECT subject AS term FROM live_edges UNION ALL
+                    SELECT predicate FROM live_edges UNION ALL
+                    SELECT object FROM live_edges
+                ) t GROUP BY term ORDER BY count DESC LIMIT %s
+            """, (limit,))
+        rows = cur.fetchall()
+    conn.close()
+    lines = [f"=== {position} vocabulary (top {limit}) ==="]
+    for term, n in rows:
+        lines.append(f"{n:4d}  {term}")
+    return "\n".join(lines)
+
+
 def main():
     mcp.run(transport="stdio")
 

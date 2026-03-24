@@ -1198,6 +1198,140 @@ def cmd_help(args):
     print("  edge polarity [predicate] [--limit N]  predicate directional alignment")
     print("  edge orient [days]                     orientation map (default 7d)")
     print("  edge starmap                           nearby graph from truths → .edge/starmap")
+    print("  edge garden [--limit N]                surface edges that need tending")
+    print("  edge name <hash> <slug>                give an existing edge a slug")
+    print("  edge words [--limit N]                 vocabulary frequency across the graph")
+
+
+# ---------------------------------------------------------------------------
+# Stewardship — garden, name, words
+# ---------------------------------------------------------------------------
+
+def cmd_garden(args):
+    """Surface edges that need tending: long terms, missing slugs on salt, near-duplicates."""
+    limit = 20
+    i = 0
+    while i < len(args):
+        if args[i] == "--limit" and i + 1 < len(args):
+            limit = int(args[i + 1]); i += 2
+        else:
+            i += 1
+
+    conn = connect()
+    with conn.cursor() as cur:
+        # Long edges — subject or object over 50 chars (likely compressed deposits)
+        cur.execute("""
+            SELECT e.id, e.subject, e.predicate, e.object, e.confidence, e.phase, f.who, e.hash, e.slug
+            FROM live_edges e JOIN frames f ON e.observer = f.token
+            WHERE length(e.subject) > 50 OR length(e.object) > 50
+            ORDER BY greatest(length(e.subject), length(e.object)) DESC
+            LIMIT %s
+        """, (limit,))
+        long_edges = cur.fetchall()
+
+        # Salt edges without slugs (high-value, unnamed)
+        cur.execute("""
+            SELECT e.id, e.subject, e.predicate, e.object, e.confidence, e.phase, f.who, e.hash, e.slug
+            FROM live_edges e JOIN frames f ON e.observer = f.token
+            WHERE e.phase = 'salt' AND e.slug IS NULL
+            AND e.predicate NOT IN ('speaks-as', 'speaks-for')
+            ORDER BY e.confidence DESC
+            LIMIT %s
+        """, (limit,))
+        unnamed_salt = cur.fetchall()
+
+    conn.close()
+
+    if long_edges:
+        print(f"  === long edges ({len(long_edges)}) — may want decomposing ===")
+        for row in long_edges:
+            _id, s, p, o, c, ph, w, h, sl = row
+            longest = max(len(s), len(o))
+            tag = f" slug:{sl}" if sl else ""
+            print(f"  [{longest}ch] ({s} --{p}--> {o}) [{c:.2f}, {ph}, @{w}] #{h}{tag}")
+
+    if unnamed_salt:
+        print(f"\n  === salt without slugs ({len(unnamed_salt)}) — worth naming? ===")
+        for row in unnamed_salt:
+            _id, s, p, o, c, ph, w, h, sl = row
+            print(f"  ({s} --{p}--> {o}) [{c:.2f}, @{w}] #{h}")
+
+    if not long_edges and not unnamed_salt:
+        print("  garden is tidy")
+
+
+def cmd_name(args):
+    """Retroactively slug an existing edge: edge name <hash-or-slug> <new-slug>"""
+    if len(args) < 2:
+        print("usage: edge name <hash> <slug>")
+        sys.exit(1)
+
+    ref, new_slug = args[0], args[1]
+    conn = connect()
+    with conn.cursor() as cur:
+        cur.execute("""
+            UPDATE edges SET slug = %s
+            WHERE (hash = %s OR slug = %s) AND dissolved_at IS NULL
+            RETURNING subject, predicate, object, hash
+        """, (new_slug, ref, ref))
+        row = cur.fetchone()
+    conn.commit()
+    conn.close()
+
+    if row:
+        s, p, o, h = row
+        print(f"  named: ({s} --{p}--> {o}) #{h} → slug:{new_slug}")
+    else:
+        print(f"  error: no live edge with hash/slug '{ref}'")
+        sys.exit(1)
+
+
+def cmd_words(args):
+    """Vocabulary frequency: what terms does the graph actually use?"""
+    limit = 30
+    kind = "all"  # all, subjects, predicates, objects
+    i = 0
+    while i < len(args):
+        if args[i] == "--limit" and i + 1 < len(args):
+            limit = int(args[i + 1]); i += 2
+        elif args[i] in ("subjects", "predicates", "objects"):
+            kind = args[i]; i += 1
+        else:
+            i += 1
+
+    conn = connect()
+    with conn.cursor() as cur:
+        if kind == "predicates":
+            cur.execute("""
+                SELECT predicate AS term, count(*) AS n
+                FROM live_edges GROUP BY predicate ORDER BY n DESC LIMIT %s
+            """, (limit,))
+        elif kind == "subjects":
+            cur.execute("""
+                SELECT subject AS term, count(*) AS n
+                FROM live_edges GROUP BY subject ORDER BY n DESC LIMIT %s
+            """, (limit,))
+        elif kind == "objects":
+            cur.execute("""
+                SELECT object AS term, count(*) AS n
+                FROM live_edges GROUP BY object ORDER BY n DESC LIMIT %s
+            """, (limit,))
+        else:
+            # All positions — unnest into one column
+            cur.execute("""
+                SELECT term, count(*) AS n FROM (
+                    SELECT subject AS term FROM live_edges
+                    UNION ALL SELECT predicate FROM live_edges
+                    UNION ALL SELECT object FROM live_edges
+                ) t GROUP BY term ORDER BY n DESC LIMIT %s
+            """, (limit,))
+
+        rows = cur.fetchall()
+    conn.close()
+
+    print(f"  === {kind} vocabulary (top {limit}) ===")
+    for term, n in rows:
+        print(f"  {n:4d}  {term}")
 
 
 # ---------------------------------------------------------------------------
@@ -1226,6 +1360,9 @@ COMMANDS = {
     "isomorph": cmd_isomorph,
     "attend": cmd_attend,
     "polarity": cmd_polarity,
+    "garden": cmd_garden,
+    "name": cmd_name,
+    "words": cmd_words,
     "help": cmd_help,
     "-h": cmd_help,
     "--help": cmd_help,
