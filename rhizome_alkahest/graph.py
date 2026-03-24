@@ -82,6 +82,22 @@ class Graph:
                 return e
             return None
 
+    def resolve_triple(self, subject: str, predicate: str, object: str) -> Edge | None:
+        """Look up a live edge by its s/p/o triple."""
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, subject, predicate, object, confidence, phase, observer, notes, created_at, slug, hash
+                   FROM live_edges WHERE subject = %s AND predicate = %s AND object = %s LIMIT 1""",
+                (subject, predicate, object),
+            )
+            row = cur.fetchone()
+            if row:
+                e = self._row_to_edge(row[:9])
+                e.slug = row[9]
+                e.hash = row[10]
+                return e
+            return None
+
     def about(self, subject: str) -> list[Edge]:
         """All living edges with this subject."""
         with self.conn.cursor() as cur:

@@ -176,13 +176,22 @@ def cmd_true(args):
 
 
 def _resolve_subject(subject: str, graph: Graph) -> str:
-    """Resolve e[slug] notation to the edge's triple as subject text."""
+    """Resolve e[slug], e[hash], or e[s p o] notation to edge-as-subject text."""
     if subject.startswith("e[") and subject.endswith("]"):
-        slug = subject[2:-1]
-        edge = graph.resolve_slug(slug)
-        if edge is None:
-            print(f"  error: no live edge with slug '{slug}'")
-            sys.exit(1)
+        inner = subject[2:-1]
+        parts = inner.split()
+        if len(parts) == 3:
+            # e[s p o] — resolve by triple content
+            edge = graph.resolve_triple(parts[0], parts[1], parts[2])
+            if edge is None:
+                print(f"  error: no live edge matching ({parts[0]} --{parts[1]}--> {parts[2]})")
+                sys.exit(1)
+        else:
+            # e[slug-or-hash]
+            edge = graph.resolve_slug(inner)
+            if edge is None:
+                print(f"  error: no live edge with slug/hash '{inner}'")
+                sys.exit(1)
         return f"e:{edge.subject}/{edge.predicate}/{edge.object}"
     return subject
 

@@ -202,12 +202,18 @@ def edge_add(
         return f"Frame incomplete ({len(frame.truths)}/3 truths). Call edge_true."
 
     g = Graph(frame)
-    # Resolve e[slug] notation
+    # Resolve e[slug], e[hash], or e[s p o] notation
     if subject.startswith("e[") and subject.endswith("]"):
-        ref_slug = subject[2:-1]
-        ref = g.resolve_slug(ref_slug)
-        if ref is None:
-            return f"error: no live edge with slug '{ref_slug}'"
+        inner = subject[2:-1]
+        parts = inner.split()
+        if len(parts) == 3:
+            ref = g.resolve_triple(parts[0], parts[1], parts[2])
+            if ref is None:
+                return f"error: no live edge matching ({parts[0]} --{parts[1]}--> {parts[2]})"
+        else:
+            ref = g.resolve_slug(inner)
+            if ref is None:
+                return f"error: no live edge with slug/hash '{inner}'"
         subject = f"e:{ref.subject}/{ref.predicate}/{ref.object}"
 
     edge = g.add(subject, predicate, object, confidence, phase, note, slug=slug or None)
