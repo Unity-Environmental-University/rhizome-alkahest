@@ -1404,8 +1404,18 @@ def cmd_words(args):
 
 
 # ---------------------------------------------------------------------------
-# Polysynthetic grammar — edge say
+# Agglutinative grammar — edge say
 # ---------------------------------------------------------------------------
+#
+# Morphology:
+#   :  — node chain (suffix). Object becomes next subject.
+#      rooms:from:inhabitation → (rooms --from--> inhabitation)
+#
+#   ~  — edge annotation (stance/evidentiality). Binds to the edge, not node.
+#      rooms~because:inhabitation drives design
+#      → edge-to-edge link: (e:s/p/rooms --because--> e:inhabitation/drives/design)
+#
+# The grammar (which predicates act as suffixes) comes from the graph itself.
 
 def _load_grammar(conn, min_uses: int = 5) -> set[str]:
     """Load the graph's own grammar: predicates used often enough to be particles."""
@@ -1421,140 +1431,135 @@ def _load_grammar(conn, min_uses: int = 5) -> set[str]:
         return {row[0] for row in cur.fetchall()}
 
 
-def _parse_say(tokens: list[str], grammar: set[str]) -> list[tuple[str, list[str]]]:
-    """Parse a sentence using graph-derived grammar.
+def _expand_agglutination(token: str, grammar: set[str]) -> tuple[str, list[tuple[str, str]], list[tuple[str, list[str]]]]:
+    """Expand a token with : and ~ suffixes.
 
-    Known predicates act as clause-splitting particles after the first triple.
-    Returns [(particle, [words...]), ...] where first clause has particle=''.
+    Returns (root, chains, annotations) where:
+      chains = [(predicate, object), ...] — node-to-node via :
+      annotations = [(predicate, [clause_words...]), ...] — edge-to-edge via ~
     """
-    clauses = []
-    current_particle = ""
-    current_words = []
-    have_first_triple = False
+    # Split ~ annotations first
+    tilde_parts = token.split("~")
+    main_part = tilde_parts[0]
+    annotations = []
+    for ann in tilde_parts[1:]:
+        # annotation might have : inside it for a full clause: ~because:inhabitation:drives:design
+        ann_colon = ann.split(":")
+        annotations.append((ann_colon[0], ann_colon[1:]))
 
-    for tok in tokens:
-        if have_first_triple and tok in grammar and len(current_words) >= 1:
-            clauses.append((current_particle, current_words))
-            current_particle = tok
-            current_words = []
+    # Split : chains
+    colon_parts = main_part.split(":")
+    root = colon_parts[0]
+    chains = []
+
+    i = 1
+    while i < len(colon_parts):
+        pred = colon_parts[i]
+        if pred in grammar and i + 1 < len(colon_parts):
+            chains.append((pred, colon_parts[i + 1]))
+            i += 2
         else:
-            current_words.append(tok)
-            if not have_first_triple and len(current_words) >= 3:
-                # Check if word 2 (index 1) is the predicate of a complete triple
-                # Don't split yet — just mark that we have a base triple
-                pass
+            # Not a known predicate — treat as part of the root
+            root = root + ":" + pred
+            i += 1
 
-    if current_words:
-        clauses.append((current_particle, current_words))
-
-    # Post-process: the first clause must be a triple (3+ words).
-    # If only one clause, it's a simple triple — no grammar active.
-    if clauses and len(clauses[0][1]) >= 3:
-        have_first_triple = True
-
-    # Re-parse with first triple knowledge if needed
-    if not have_first_triple:
-        return clauses
-
-    # Actually we need to re-parse since we didn't split on the first pass correctly.
-    # Let me do it properly: first 3 words are always the base triple.
-    # Everything after is parsed for grammar particles.
-    if len(tokens) < 3:
-        return [("", tokens)]
-
-    base = tokens[:3]
-    rest = tokens[3:]
-    clauses = [("", base)]
-
-    if not rest:
-        return clauses
-
-    current_particle = ""
-    current_words = []
-
-    for tok in rest:
-        if tok in grammar and len(current_words) >= 1:
-            clauses.append((current_particle, current_words))
-            current_particle = tok
-            current_words = []
-        elif tok in grammar and len(current_words) == 0:
-            # Particle right after another particle or right after base triple
-            current_particle = tok
-        else:
-            current_words.append(tok)
-
-    if current_words:
-        clauses.append((current_particle, current_words))
-
-    return clauses
+    return root, chains, annotations
 
 
 def cmd_say(args):
-    """Polysynthetic edge creation. Graph predicates become grammar particles.
+    """Agglutinative edge creation. Suffixes generate edges.
 
-    edge say hallie builds rooms from inhabitation
-    → (hallie --builds--> rooms) + (rooms --from--> inhabitation)
+    : chains nodes     — edge say hallie builds rooms:from:inhabitation
+    ~ annotates edges  — edge say hallie builds rooms~because:inhabitation:drives:design
 
-    edge say shear is zpd-boundary glows-because apophasis
-    → (shear --is--> zpd-boundary) + (zpd-boundary --glows-because--> apophasis)
+    Grammar predicates come from the graph itself (predicates with >= 5 uses).
     """
     dry = "--dry" in args
     args = [a for a in args if a != "--dry"]
 
     if len(args) < 3:
-        print("usage: edge say <word> <word> <word> [<word>...]")
-        print("  known predicates from the graph become clause separators")
+        print("usage: edge say <s> <p> <o[:pred:val...]> [<s> <p> <o> ...]")
+        print("  :  chains nodes (object → subject)")
+        print("  ~  annotates edges (edge-to-edge)")
+        print("  grammar comes from predicates with >= 5 uses")
         sys.exit(1)
 
     conn = connect()
     grammar = _load_grammar(conn)
     conn.close()
 
-    clauses = _parse_say(args, grammar)
+    # Parse into triples: every 3 space-separated tokens is a triple,
+    # but tokens may contain : and ~ suffixes that expand into more edges
+    if len(args) % 3 != 0:
+        # Allow trailing : chains on last token
+        pass
+
+    # Group into base triples
+    triples = []
+    i = 0
+    while i + 2 < len(args):
+        triples.append((args[i], args[i + 1], args[i + 2]))
+        i += 3
 
     if dry:
-        print(f"  grammar particles ({len(grammar)}): {', '.join(sorted(grammar)[:20])}...")
+        print(f"  grammar ({len(grammar)}): {', '.join(sorted(grammar)[:20])}...")
         print()
-        for particle, words in clauses:
-            if particle:
-                print(f"  [{particle}]")
-            if len(words) >= 3:
-                print(f"    ({words[0]} --{words[1]}--> {words[2]})")
-            elif len(words) == 2:
-                print(f"    (prev.object --{words[0]}--> {words[1]})")
-            elif len(words) == 1:
-                print(f"    (prev.subject --{particle}--> {words[0]})")
+        for s, p, o in triples:
+            s_root, s_chains, s_anns = _expand_agglutination(s, grammar)
+            o_root, o_chains, o_anns = _expand_agglutination(o, grammar)
+            print(f"  ({s_root} --{p}--> {o_root})")
+            for cp, co in o_chains:
+                prev = o_root if not o_chains[:1] else o_root
+                print(f"    ({o_root} --{cp}--> {co})")
+                o_root = co  # chain forward
+            for ap, awords in o_anns:
+                if len(awords) >= 2:
+                    print(f"    e:... --{ap}--> e:{awords[0]}/.../{awords[-1]}")
+                elif awords:
+                    print(f"    e:... --{ap}--> {awords[0]}")
+                else:
+                    print(f"    ~{ap}")
         return
 
     frame = _require_frame()
     g = Graph(frame)
-    prev_edge = None
 
-    for idx, (particle, words) in enumerate(clauses):
-        if len(words) >= 3:
-            s, p, o = words[0], words[1], words[2]
-        elif len(words) == 2 and prev_edge:
-            # 2 words after particle: previous object chains forward
-            s, p, o = prev_edge.object, words[0], words[1]
-        elif len(words) == 1 and prev_edge:
-            # 1 word after particle: previous subject, particle as predicate
-            s, p, o = prev_edge.subject, particle, words[0]
-        else:
-            print(f"  error: can't parse clause after '{particle}': {words}")
-            sys.exit(1)
+    for s_raw, p, o_raw in triples:
+        s_root, s_chains, s_anns = _expand_agglutination(s_raw, grammar)
+        o_root, o_chains, o_anns = _expand_agglutination(o_raw, grammar)
 
-        s = _resolve_subject(s, g)
-        edge = g.add(s, p, o)
-        print(f"  + {_fmt_edge(edge)}  #{edge.hash}")
+        s_root = _resolve_subject(s_root, g)
 
-        # Link clauses via particle (edge-as-subject)
-        if particle and prev_edge:
-            prev_ref = f"e:{prev_edge.subject}/{prev_edge.predicate}/{prev_edge.object}"
-            this_ref = f"e:{edge.subject}/{edge.predicate}/{edge.object}"
-            link = g.add(prev_ref, particle, this_ref)
-            print(f"    {particle} → #{link.hash}")
+        # Base triple
+        base = g.add(s_root, p, o_root)
+        print(f"  + {_fmt_edge(base)}  #{base.hash}")
 
-        prev_edge = edge
+        # Object chains: rooms:from:inhabitation → (rooms --from--> inhabitation)
+        chain_prev = o_root
+        for cp, co in o_chains:
+            chain_edge = g.add(chain_prev, cp, co)
+            print(f"    : {_fmt_edge(chain_edge)}  #{chain_edge.hash}")
+            chain_prev = co
+
+        # Edge annotations via ~
+        base_ref = f"e:{base.subject}/{base.predicate}/{base.object}"
+        for ap, awords in o_anns:
+            if len(awords) >= 3:
+                # Full clause annotation: ~because:inhabitation:drives:design
+                ann_s, ann_p, ann_o = awords[0], awords[1], awords[2]
+                ann_edge = g.add(ann_s, ann_p, ann_o)
+                ann_ref = f"e:{ann_edge.subject}/{ann_edge.predicate}/{ann_edge.object}"
+                link = g.add(base_ref, ap, ann_ref)
+                print(f"    ~ {_fmt_edge(ann_edge)}  #{ann_edge.hash}")
+                print(f"      {ap} → #{link.hash}")
+            elif len(awords) == 1:
+                # Simple annotation: ~obs, ~inf, ~rep or ~stance:value
+                link = g.add(base_ref, ap, awords[0])
+                print(f"    ~ ({base_ref} --{ap}--> {awords[0]})  #{link.hash}")
+            elif len(awords) == 0:
+                # Bare marker: ~obs → edge --evidentiality--> obs
+                link = g.add(base_ref, "evidentiality", ap)
+                print(f"    ~ ({base_ref} --evidentiality--> {ap})  #{link.hash}")
 
 
 # ---------------------------------------------------------------------------
