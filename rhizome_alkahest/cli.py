@@ -1897,7 +1897,7 @@ def cmd_dream(args):
 
     random.shuffle(edges)
 
-    prompt = f"""You are dreaming.
+    prompt_narrative = f"""You are dreaming.
 
 Here are some things that were next to each other when you woke up:
 
@@ -1905,11 +1905,19 @@ Here are some things that were next to each other when you woke up:
 
 Let them be near each other. What do you notice? Not what they mean — what they *touch*.
 
-When you're ready, leave what you found. A few new connections — things not already above — as short triples (subject predicate object), one per line. Then a blank line, then the image or feeling that came with them."""
+Write a short paragraph — a few sentences — about what you see between them. Free-associate. Follow the heat. Don't name edges or triples, just write."""
+
+    prompt_extract = """Here is a dream narrative:
+
+{narrative}
+
+What did it find? Pull out 1-3 relationships the dream made — connections between things, not descriptions of single things. Write them as short triples: subject predicate object (hyphenated names, 1-4 words each), one per line.
+
+Then a blank line, then one sentence for the feeling."""
 
     if dry:
-        print("  === dream prompt ===")
-        print(prompt)
+        print("  === dream prompt (pass 1: narrative) ===")
+        print(prompt_narrative)
         print(f"\n  model: {model}")
         print(f"  edges: {len(edges)}")
         return
@@ -1918,17 +1926,16 @@ When you're ready, leave what you found. A few new connections — things not al
     qwen_url = os.environ.get("QWEN_URL", "http://localhost:5052")
     use_local = model.startswith("qwen") or model == "local"
     if not use_local:
-        # Auto-detect: try local Qwen first if no ANTHROPIC_API_KEY
         if not os.environ.get("ANTHROPIC_API_KEY"):
             use_local = True
 
-    try:
+    def _call_llm(prompt_text, max_tokens=300):
         if use_local:
             import urllib.request
             req_body = json.dumps({
                 "model": "Qwen/Qwen2.5-7B-Instruct",
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 300,
+                "messages": [{"role": "user", "content": prompt_text}],
+                "max_tokens": max_tokens,
                 "temperature": 0.9,
             }).encode()
             req = urllib.request.Request(
@@ -1938,17 +1945,26 @@ When you're ready, leave what you found. A few new connections — things not al
             )
             with urllib.request.urlopen(req, timeout=120) as resp:
                 result = json.loads(resp.read())
-            dream_text = result["choices"][0]["message"]["content"].strip()
-            model = f"qwen-local ({qwen_url})"
+            return result["choices"][0]["message"]["content"].strip()
         else:
             import anthropic
             client = anthropic.Anthropic()
             response = client.messages.create(
                 model=model,
-                max_tokens=300,
-                messages=[{"role": "user", "content": prompt}],
+                max_tokens=max_tokens,
+                messages=[{"role": "user", "content": prompt_text}],
             )
-            dream_text = response.content[0].text.strip()
+            return response.content[0].text.strip()
+
+    try:
+        # Pass 1: free-associate a narrative
+        narrative = _call_llm(prompt_narrative, max_tokens=400)
+        print(f"  === dream narrative ===")
+        print(f"  {narrative}")
+        print()
+
+        # Pass 2: extract edges from the narrative
+        dream_text = _call_llm(prompt_extract.format(narrative=narrative), max_tokens=200)
     except Exception as e:
         print(f"  dream failed: {e}")
         return
