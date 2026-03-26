@@ -1,5 +1,9 @@
 """Embedding — sentence-transformers for edge text."""
 
+import os
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+
 from typing import Optional
 
 _model = None
@@ -12,8 +16,23 @@ def get_model():
     """Lazy-load the sentence transformer model."""
     global _model
     if _model is None:
+        import os, logging
+        os.environ["TOKENIZERS_PARALLELISM"] = "false"
+        os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+        os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+        os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+        logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
+        logging.getLogger("sentence_transformers").setLevel(logging.WARNING)
+        import transformers
+        transformers.logging.set_verbosity_error()
         from sentence_transformers import SentenceTransformer
-        _model = SentenceTransformer(EMBEDDING_MODEL)
+        import sys, io
+        _stderr = sys.stderr
+        sys.stderr = io.StringIO()  # suppress noisy model load output
+        try:
+            _model = SentenceTransformer(EMBEDDING_MODEL)
+        finally:
+            sys.stderr = _stderr
     return _model
 
 
@@ -34,7 +53,7 @@ def embed(text: str) -> list[float]:
 def embed_batch(texts: list[str], batch_size: int = 256) -> list[list[float]]:
     """Embed a batch of text strings."""
     model = get_model()
-    return [e.tolist() for e in model.encode(texts, batch_size=batch_size, show_progress_bar=True)]
+    return [e.tolist() for e in model.encode(texts, batch_size=batch_size, show_progress_bar=False)]
 
 
 def embed_edge(subject: str, predicate: str, object: str, notes: str = "") -> list[float]:
