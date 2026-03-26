@@ -780,8 +780,8 @@ def cmd_digest(args):
     ParallaxDigest(who=who).run(limit=limit, min_spread=min_spread, dry_run=dry_run, verbose=verbose)
 
 
-def cmd_isomorph(args):
-    from .digest import IsomorphFinder, default_who
+def cmd_overlap(args):
+    from .digest import OverlapFinder, default_who
     limit = 5
     min_jaccard = 0.3
     dry_run = False
@@ -802,7 +802,7 @@ def cmd_isomorph(args):
         else:
             i += 1
     who = who or default_who()
-    IsomorphFinder(who=who).run(limit=limit, min_jaccard=min_jaccard, dry_run=dry_run, verbose=verbose)
+    OverlapFinder(who=who).run(limit=limit, min_jaccard=min_jaccard, dry_run=dry_run, verbose=verbose)
 
 
 def cmd_attend(args):
@@ -815,19 +815,68 @@ def cmd_attend(args):
       4. Parallax boost: edges with high spread get attention (disagreement is interesting)
 
     --parallax: show where individual truths disagree about what matters
+    --recovery: show inter-deposit intervals (learning governor arousal signal)
     --limit N: how many results (default 20)
     """
     import math
     from collections import Counter
 
     do_parallax = "--parallax" in args
+    do_recovery = "--recovery" in args
     limit = 20
     i = 0
     while i < len(args):
         if args[i] == "--limit" and i + 1 < len(args):
             limit = int(args[i + 1]); i += 2
+        elif args[i] in ("--parallax", "--recovery"):
+            i += 1
         else:
             i += 1
+
+    if do_recovery:
+        conn = connect()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT f.who, e.created_at,
+                       EXTRACT(EPOCH FROM e.created_at - LAG(e.created_at) OVER (PARTITION BY f.who ORDER BY e.created_at)) AS gap_sec
+                FROM live_edges e JOIN frames f ON e.observer = f.token
+                WHERE e.created_at > now() - interval '2 hours'
+                AND e.predicate NOT IN ('speaks-as', 'speaks-for', 'scoped-to', 'reply-to',
+                                        'needs-attention-from', 'records', 'completed-on')
+                ORDER BY f.who, e.created_at
+            """)
+            rows = cur.fetchall()
+        conn.close()
+
+        if not rows:
+            print("  === recovery — no deposits in last 2 hours ===")
+            return
+
+        from collections import defaultdict
+        observer_gaps = defaultdict(list)
+        for who, ts, gap in rows:
+            if gap is not None:
+                observer_gaps[who].append(gap)
+
+        print("  === inter-deposit intervals — learning governor arousal signal ===")
+        for who, gaps in sorted(observer_gaps.items(), key=lambda x: -len(x[1])):
+            if not gaps:
+                continue
+            avg = sum(gaps) / len(gaps)
+            shortest = min(gaps)
+            longest = max(gaps)
+            rapid = sum(1 for g in gaps if g < 30)
+            signal = ""
+            if avg < 30:
+                signal = " ⚠ ceiling: rapid-fire deposits, system may be flooding"
+            elif avg > 600:
+                signal = " ⚠ floor: long gaps, system may be disengaged"
+            elif rapid > len(gaps) * 0.5:
+                signal = " ⚡ bursting: >50% of intervals under 30s"
+            else:
+                signal = " ✓ in window"
+            print(f"  @{who}: {len(gaps)+1} deposits, avg {avg:.0f}s apart (min {shortest:.0f}s, max {longest:.0f}s){signal}")
+        return
 
     frame = _require_frame()
 
@@ -1193,7 +1242,7 @@ def cmd_help(args):
     print("Discover:")
     print("  edge ran <movement>                    register run + show prior deposits")
     print("  edge digest [--limit N] [--min-spread F] [--who 'name'] [--dry-run]")
-    print("  edge isomorph [--limit N] [--min-jaccard F] [--who 'name'] [--dry-run]")
+    print("  edge overlap [--limit N] [--min-jaccard F] [--who 'name'] [--dry-run]")
     print("  edge attend [--parallax] [--limit N]    subjective attention from truths")
     print("  edge polarity [predicate] [--limit N]  predicate directional alignment")
     print("  edge orient [days]                     orientation map (default 7d)")
@@ -1211,17 +1260,93 @@ def cmd_help(args):
 # ---------------------------------------------------------------------------
 
 def cmd_garden(args):
-    """Surface edges that need tending: long terms, missing slugs on salt, near-duplicates."""
+    """Surface edges that need tending: long terms, missing slugs on salt, near-duplicates.
+
+    --pace: show deposit rate per observer in last hour (learning governor dose signal)
+    --fluid-ratio: show fluid/salt ratio per observer (integration signal)
+    --limit N: max results per section (default 20)
+    """
     limit = 20
+    do_pace = "--pace" in args
+    do_fluid_ratio = "--fluid-ratio" in args
     i = 0
     while i < len(args):
         if args[i] == "--limit" and i + 1 < len(args):
             limit = int(args[i + 1]); i += 2
+        elif args[i] in ("--pace", "--fluid-ratio"):
+            i += 1
         else:
             i += 1
 
     conn = connect()
     with conn.cursor() as cur:
+        # --- Learning governor: pace signal ---
+        if do_pace:
+            cur.execute("""
+                SELECT f.who,
+                       count(*) AS deposits,
+                       min(e.created_at) AS first_deposit,
+                       max(e.created_at) AS last_deposit,
+                       EXTRACT(EPOCH FROM max(e.created_at) - min(e.created_at)) / NULLIF(count(*) - 1, 0) AS avg_interval_sec
+                FROM live_edges e JOIN frames f ON e.observer = f.token
+                WHERE e.created_at > now() - interval '1 hour'
+                AND e.predicate NOT IN ('speaks-as', 'speaks-for', 'scoped-to', 'reply-to',
+                                        'needs-attention-from', 'records', 'completed-on')
+                GROUP BY f.who
+                ORDER BY count(*) DESC
+            """)
+            pace_rows = cur.fetchall()
+            if pace_rows:
+                print("  === deposit pace (last hour) — learning governor dose signal ===")
+                for who, count, first, last, avg_sec in pace_rows:
+                    interval_str = f"{avg_sec:.0f}s between deposits" if avg_sec else "single deposit"
+                    warning = ""
+                    if count > 15:
+                        warning = " ⚠ hyper-mode (>15 deposits/hour)"
+                    elif avg_sec and avg_sec < 30:
+                        warning = " ⚠ rapid-fire (<30s intervals)"
+                    print(f"  @{who}: {count} deposits, {interval_str}{warning}")
+            else:
+                print("  === deposit pace — no deposits in last hour ===")
+            print()
+
+        # --- Learning governor: fluid/salt ratio ---
+        if do_fluid_ratio:
+            cur.execute("""
+                SELECT f.who,
+                       count(*) FILTER (WHERE e.phase = 'fluid') AS fluid,
+                       count(*) FILTER (WHERE e.phase = 'salt') AS salt,
+                       count(*) FILTER (WHERE e.phase = 'volatile') AS volatile,
+                       count(*) AS total
+                FROM live_edges e JOIN frames f ON e.observer = f.token
+                AND e.predicate NOT IN ('speaks-as', 'speaks-for', 'scoped-to', 'reply-to',
+                                        'needs-attention-from', 'records', 'completed-on')
+                GROUP BY f.who
+                ORDER BY count(*) FILTER (WHERE e.phase = 'fluid') DESC
+                LIMIT %s
+            """, (limit,))
+            ratio_rows = cur.fetchall()
+            if ratio_rows:
+                print("  === fluid/salt ratio — learning governor integration signal ===")
+                for who, fluid, salt, volatile, total in ratio_rows:
+                    ratio = fluid / salt if salt > 0 else float('inf')
+                    warning = ""
+                    if ratio > 5.0:
+                        warning = " ⚠ window too open (fluid/salt > 5:1)"
+                    elif salt > 0 and ratio < 0.5:
+                        warning = " ⚠ mostly hardened (fluid/salt < 1:2)"
+                    ratio_str = f"{ratio:.1f}:1" if salt > 0 else "∞ (no salt)"
+                    print(f"  @{who}: {fluid} fluid, {salt} salt, {volatile} volatile ({total} total) — ratio {ratio_str}{warning}")
+            else:
+                print("  === fluid/salt ratio — no edges ===")
+            print()
+
+        # If only governor flags were requested, skip standard garden
+        if do_pace or do_fluid_ratio:
+            if not (set(args) - {"--pace", "--fluid-ratio", "--limit"} - {str(limit)}):
+                conn.close()
+                return
+
         # Long edges — subject or object over 50 chars, excluding already-decomposed
         cur.execute("""
             SELECT e.id, e.subject, e.predicate, e.object, e.confidence, e.phase, f.who, e.hash, e.slug
@@ -1264,7 +1389,7 @@ def cmd_garden(args):
             _id, s, p, o, c, ph, w, h, sl = row
             print(f"  ({s} --{p}--> {o}) [{c:.2f}, @{w}] #{h}")
 
-    if not long_edges and not unnamed_salt:
+    if not long_edges and not unnamed_salt and not do_pace and not do_fluid_ratio:
         print("  garden is tidy")
 
 
@@ -1643,6 +1768,245 @@ def cmd_alias(args):
 
 
 # ---------------------------------------------------------------------------
+# Dream
+# ---------------------------------------------------------------------------
+
+def cmd_dream(args):
+    """Pull random edges, free-associate across them, deposit a dream.
+
+    The isle is full of noises, sounds and sweet airs, that give delight and hurt not.
+
+    --n N: how many random edges to pull (default 5)
+    --anti-orient: also pull edges far from current truths (requires frame)
+    --dry: show the dream prompt without running it
+    --model MODEL: which model to use (default claude-haiku-4-5-20251001)
+    """
+    import random
+
+    n = 5
+    anti_orient = "--anti-orient" in args
+    dry = "--dry" in args
+    model = "claude-haiku-4-5-20251001"
+    i = 0
+    while i < len(args):
+        if args[i] == "--n" and i + 1 < len(args):
+            n = int(args[i + 1]); i += 2
+        elif args[i] == "--model" and i + 1 < len(args):
+            model = args[i + 1]; i += 2
+        elif args[i] in ("--anti-orient", "--dry"):
+            i += 1
+        else:
+            i += 1
+
+    conn = connect()
+    edges = []      # display strings for the prompt
+    triples = []    # (s, p, o) tuples for provenance links
+
+    with conn.cursor() as cur:
+        # Pull random knowledge edges — fluid and volatile only (salt has settled, doesn't dream)
+        cur.execute("""
+            SELECT e.subject, e.predicate, e.object, e.notes, e.phase, f.who
+            FROM live_edges e JOIN frames f ON e.observer = f.token
+            WHERE e.phase IN ('fluid', 'volatile')
+            AND e.predicate NOT IN ('speaks-as', 'speaks-for', 'scoped-to', 'reply-to',
+                                      'needs-attention-from', 'records', 'completed-on',
+                                      'decomposed-into', 'compressed-to', 'dreamt-on')
+            AND e.subject NOT LIKE 'task:%%'
+            ORDER BY random()
+            LIMIT %s
+        """, (n,))
+        for row in cur.fetchall():
+            s, p, o, notes, phase, who = row
+            edge_str = f"({s} --{p}--> {o})"
+            if notes:
+                edge_str += f" [note: {notes}]"
+            edges.append(edge_str)
+            triples.append((s, p, o))
+
+        # Salt anchor — one settled edge to ground the dream (the familiar house)
+        cur.execute("""
+            SELECT e.subject, e.predicate, e.object, e.notes, e.phase, f.who
+            FROM live_edges e JOIN frames f ON e.observer = f.token
+            WHERE e.phase = 'salt'
+            AND e.predicate NOT IN ('speaks-as', 'speaks-for', 'scoped-to', 'reply-to',
+                                    'needs-attention-from', 'records', 'completed-on',
+                                    'move-chosen', 'valuation', 'outcome')
+            AND e.subject NOT LIKE 'task:%%'
+            AND e.subject NOT LIKE 'go9:%%'
+            AND e.subject NOT LIKE 'connect5:%%'
+            ORDER BY random()
+            LIMIT 1
+        """)
+        salt_row = cur.fetchone()
+        if salt_row:
+            s, p, o, notes, phase, who = salt_row
+            edge_str = f"({s} --{p}--> {o}) [salt]"
+            if notes:
+                edge_str += f" [note: {notes}]"
+            edges.append(edge_str)
+            triples.append((s, p, o))
+
+        # Anti-orient: pull edges far from current truths
+        if anti_orient:
+            try:
+                frame = _require_frame()
+                # Get truth terms
+                truth_terms = set()
+                for t in frame.truths:
+                    for val in [t.get("s", ""), t.get("p", ""), t.get("o", "")]:
+                        truth_terms.update(val.replace("-", " ").split())
+
+                if truth_terms:
+                    # Pull edges that share NO terms with truths (fluid/volatile only)
+                    cur.execute("""
+                        SELECT e.subject, e.predicate, e.object, e.notes, e.phase
+                        FROM live_edges e
+                        WHERE e.phase IN ('fluid', 'volatile')
+                        AND e.predicate NOT IN ('speaks-as', 'speaks-for', 'scoped-to', 'reply-to',
+                                                  'needs-attention-from', 'records', 'completed-on',
+                                                  'dreamt-on')
+                        AND e.subject NOT LIKE 'task:%%'
+                        ORDER BY random()
+                        LIMIT 50
+                    """)
+                    cold_edges = []
+                    cold_triples = []
+                    for row in cur.fetchall():
+                        s, p, o, notes, phase = row
+                        all_text = f"{s} {p} {o}".replace("-", " ")
+                        overlap = sum(1 for t in truth_terms if t.lower() in all_text.lower())
+                        if overlap == 0:
+                            edge_str = f"({s} --{p}--> {o})"
+                            if notes:
+                                edge_str += f" [note: {notes}]"
+                            cold_edges.append(edge_str)
+                            cold_triples.append((s, p, o))
+                    # Take up to 2 cold edges
+                    edges.extend(cold_edges[:2])
+                    triples.extend(cold_triples[:2])
+            except SystemExit:
+                pass  # No frame, skip anti-orient
+
+    conn.close()
+
+    if not edges:
+        print("  no edges to dream on")
+        return
+
+    random.shuffle(edges)
+
+    prompt = f"""You are dreaming. Not thinking, not analyzing, not synthesizing. Dreaming.
+
+Below are edges from a knowledge graph. They were pulled at random — they have no reason to be next to each other. Let them resonate. What connections appear unbidden?
+
+Your output is NEW EDGES — short, threadable triples that name what the dream found. Things like:
+  appeal-to-arms bridges moby-dick and zhuangzi
+  polling-for-presence prevents presence
+  the-gift survives its-recipients
+
+Output 1-3 edges, one per line, in the format: subject predicate object
+Then a blank line, then a one-sentence dream-note (the image, the feeling, the fragment).
+
+Keep node names short (1-4 hyphenated words). The edges are the discovery. The note is the texture.
+
+The edges:
+{chr(10).join(f"  {e}" for e in edges)}
+
+Edges found:"""
+
+    if dry:
+        print("  === dream prompt ===")
+        print(prompt)
+        print(f"\n  model: {model}")
+        print(f"  edges: {len(edges)}")
+        return
+
+    # Call the model — prefer local Qwen, fall back to Anthropic API
+    qwen_url = os.environ.get("QWEN_URL", "http://localhost:5052")
+    use_local = model.startswith("qwen") or model == "local"
+    if not use_local:
+        # Auto-detect: try local Qwen first if no ANTHROPIC_API_KEY
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            use_local = True
+
+    try:
+        if use_local:
+            import urllib.request
+            req_body = json.dumps({
+                "model": "Qwen/Qwen2.5-7B-Instruct",
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 300,
+                "temperature": 0.9,
+            }).encode()
+            req = urllib.request.Request(
+                f"{qwen_url}/v1/chat/completions",
+                data=req_body,
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                result = json.loads(resp.read())
+            dream_text = result["choices"][0]["message"]["content"].strip()
+            model = f"qwen-local ({qwen_url})"
+        else:
+            import anthropic
+            client = anthropic.Anthropic()
+            response = client.messages.create(
+                model=model,
+                max_tokens=300,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            dream_text = response.content[0].text.strip()
+    except Exception as e:
+        print(f"  dream failed: {e}")
+        return
+
+    # Parse the response: lines with 3+ words are edges, blank line separates, rest is dream-note
+    lines = dream_text.strip().split("\n")
+    found_edges = []
+    dream_note = ""
+    past_blank = False
+    for line in lines:
+        line = line.strip()
+        if not line:
+            past_blank = True
+            continue
+        if past_blank:
+            dream_note = (dream_note + " " + line).strip() if dream_note else line
+        else:
+            parts = line.split(None, 2)
+            if len(parts) >= 3:
+                found_edges.append((parts[0], parts[1], parts[2]))
+            elif len(parts) == 2:
+                found_edges.append((parts[0], "touches", parts[1]))
+
+    # Print the dream
+    print(f"  === dream ({len(edges)} edges pulled, {len(found_edges)} edges found) ===")
+    for s, p, o in found_edges:
+        print(f"  ({s} --{p}--> {o})")
+    if dream_note:
+        print(f"  note: {dream_note}")
+    print()
+    print(f"  dreamt on:")
+    for e in edges:
+        print(f"    {e}")
+
+    # Deposit found edges as volatile with dreamt-on provenance
+    try:
+        frame = _require_frame()
+        g = Graph(frame)
+        for ds, dp, do_ in found_edges:
+            edge = g.add(ds, dp, do_, 0.5, "volatile", dream_note)
+            print(f"  + ({ds} --{dp}--> {do_}) #{edge.hash} [volatile]")
+            # Link each found edge to its source edges
+            dream_node = f"e:{ds}/{dp}/{do_}"
+            for src_s, src_p, src_o in triples:
+                source_node = f"e:{src_s}/{src_p}/{src_o}"
+                g.add(dream_node, "dreamt-on", source_node, 0.5, "volatile", "")
+    except (SystemExit, Exception) as e:
+        print(f"  (dream not deposited — {e})")
+
+
+# ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
 
@@ -1665,7 +2029,7 @@ COMMANDS = {
     "starmap": cmd_starmap,
     "raw": cmd_raw,
     "digest": cmd_digest,
-    "isomorph": cmd_isomorph,
+    "overlap": cmd_overlap,
     "attend": cmd_attend,
     "polarity": cmd_polarity,
     "garden": cmd_garden,
@@ -1674,6 +2038,7 @@ COMMANDS = {
     "words": cmd_words,
     "say": cmd_say,
     "alias": cmd_alias,
+    "dream": cmd_dream,
     "help": cmd_help,
     "-h": cmd_help,
     "--help": cmd_help,
