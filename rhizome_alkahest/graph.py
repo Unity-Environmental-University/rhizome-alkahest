@@ -40,13 +40,19 @@ class Graph:
         """Record an edge from this frame's position."""
         pos = json.dumps(git_context())
         ehash = edge_hash(subject, predicate, object, self.frame.token)
+        # Embed on insert
+        try:
+            from .embed import embed_edge
+            vec = embed_edge(subject, predicate, object, notes)
+        except Exception:
+            vec = None
         with self.conn.cursor() as cur:
             cur.execute(
-                """INSERT INTO edges (subject, predicate, object, confidence, phase, observer, notes, positionality, slug, hash)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """INSERT INTO edges (subject, predicate, object, confidence, phase, observer, notes, positionality, slug, hash, embedding)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                    ON CONFLICT DO NOTHING
                    RETURNING id, created_at""",
-                (subject, predicate, object, confidence, phase, self.frame.token, notes, pos, slug, ehash),
+                (subject, predicate, object, confidence, phase, self.frame.token, notes, pos, slug, ehash, vec),
             )
             row = cur.fetchone()
         self.conn.commit()

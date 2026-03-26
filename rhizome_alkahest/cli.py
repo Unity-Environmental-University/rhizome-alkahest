@@ -1243,6 +1243,7 @@ def cmd_help(args):
     print("  edge ran <movement>                    register run + show prior deposits")
     print("  edge digest [--limit N] [--min-spread F] [--who 'name'] [--dry-run]")
     print("  edge overlap [--limit N] [--min-jaccard F] [--who 'name'] [--dry-run]")
+    print("  edge embed [--batch-size N] [--dry-run]    backfill missing embeddings")
     print("  edge attend [--parallax] [--limit N]    subjective attention from truths")
     print("  edge polarity [predicate] [--limit N]  predicate directional alignment")
     print("  edge orient [days]                     orientation map (default 7d)")
@@ -2006,6 +2007,39 @@ Edges found:"""
         print(f"  (dream not deposited — {e})")
 
 
+def cmd_embed(args):
+    """Backfill embeddings for edges missing them."""
+    from .db import connect
+    from .embed import embed_batch, edge_text
+    batch_size = 256
+    dry_run = False
+    for i, arg in enumerate(args):
+        if arg == "--batch-size" and i + 1 < len(args):
+            batch_size = int(args[i + 1])
+        elif arg == "--dry-run":
+            dry_run = True
+    conn = connect()
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, subject, predicate, object, notes FROM live_edges WHERE embedding IS NULL"
+        )
+        rows = cur.fetchall()
+    if not rows:
+        print("All edges already have embeddings.")
+        return
+    print(f"  {len(rows)} edges missing embeddings. Embedding in batches of {batch_size}...")
+    if dry_run:
+        print("  (dry run — not writing)")
+        return
+    texts = [edge_text(r[1], r[2], r[3], r[4] or "") for r in rows]
+    vectors = embed_batch(texts, batch_size=batch_size)
+    with conn.cursor() as cur:
+        for (row, vec) in zip(rows, vectors):
+            cur.execute("UPDATE edges SET embedding = %s WHERE id = %s", (vec, row[0]))
+    conn.commit()
+    print(f"  {len(rows)} embeddings written.")
+
+
 # ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
@@ -2039,6 +2073,7 @@ COMMANDS = {
     "say": cmd_say,
     "alias": cmd_alias,
     "dream": cmd_dream,
+    "embed": cmd_embed,
     "help": cmd_help,
     "-h": cmd_help,
     "--help": cmd_help,
