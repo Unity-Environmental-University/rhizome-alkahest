@@ -25,14 +25,17 @@ def get_model():
         logging.getLogger("sentence_transformers").setLevel(logging.WARNING)
         import transformers
         transformers.logging.set_verbosity_error()
-        from sentence_transformers import SentenceTransformer
-        import sys, io
-        _stderr = sys.stderr
-        sys.stderr = io.StringIO()  # suppress noisy model load output
+        import sys
+        _fd = os.dup(2)
+        _devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(_devnull, 2)  # suppress noisy C-level stderr during load
         try:
+            from sentence_transformers import SentenceTransformer
             _model = SentenceTransformer(EMBEDDING_MODEL)
         finally:
-            sys.stderr = _stderr
+            os.dup2(_fd, 2)
+            os.close(_fd)
+            os.close(_devnull)
     return _model
 
 
