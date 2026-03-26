@@ -358,17 +358,17 @@ class Isomorphism:
     jaccard: float
 
 
-class IsomorphFinder:
+class OverlapFinder:
     """
     Finds structurally similar node pairs (same predicate shapes, different domains)
-    and asks Qwen whether the similarity is a genuine isomorphism.
+    and asks Qwen whether the overlap is a genuine structural correspondence.
 
     Usage:
-        finder = IsomorphFinder()
+        finder = OverlapFinder()
         results = finder.run(limit=5)
 
     CLI:
-        edge isomorph [--limit N] [--min-jaccard F] [--dry-run]
+        edge overlap [--limit N] [--min-jaccard F] [--dry-run]
     """
 
     NOISE_PREFIXES = ("connect5:", "go9:", "sf-schema:")
@@ -383,7 +383,7 @@ class IsomorphFinder:
         if self._frame:
             return self._frame
         truths = [
-            (self.who, "role", "isomorphism-detector"),
+            (self.who, "role", "overlap-detector"),
             (self.who, "task", "find-structural-correspondence"),
             (self.who, "output", "bridge-edges"),
         ]

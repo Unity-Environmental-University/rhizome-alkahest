@@ -81,7 +81,7 @@ edge ran <movement>        # register a qigong movement run, show prior deposits
 
 ```bash
 edge digest [--limit N] [--min-spread F] [--dry-run]    # parallax digest via Qwen
-edge isomorph [--limit N] [--min-jaccard F] [--dry-run]  # find structural isomorphisms
+edge overlap [--limit N] [--min-jaccard F] [--dry-run]   # find predicate-set overlaps between nodes
 ```
 
 ## Phases

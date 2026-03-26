@@ -141,3 +141,35 @@ CREATE VIEW parallax_token AS
     JOIN frames f ON e.observer = f.token
     GROUP BY e.subject, e.predicate, e.object
     HAVING count(DISTINCT e.observer) > 1;
+
+-- Node neighborhoods — embeddable text blocks per node for semantic search.
+-- Concatenates all triples touching a node. Refresh after bulk inserts.
+CREATE MATERIALIZED VIEW node_neighborhood AS
+WITH all_nodes AS (
+    SELECT DISTINCT subject AS node FROM live_edges
+    UNION
+    SELECT DISTINCT object AS node FROM live_edges
+),
+node_triples AS (
+    SELECT
+        n.node,
+        string_agg(
+            DISTINCT e.subject || ' ' || e.predicate || ' ' || e.object,
+            '; '
+            ORDER BY e.subject || ' ' || e.predicate || ' ' || e.object
+        ) AS neighborhood_text,
+        count(DISTINCT e.id) AS edge_count
+    FROM all_nodes n
+    JOIN live_edges e ON e.subject = n.node OR e.object = n.node
+    GROUP BY n.node
+)
+SELECT
+    node,
+    neighborhood_text,
+    edge_count,
+    NULL::vector(384) AS embedding
+FROM node_triples;
+
+CREATE UNIQUE INDEX idx_node_neighborhood_node ON node_neighborhood (node);
+CREATE INDEX idx_node_neighborhood_embedding ON node_neighborhood
+    USING ivfflat (embedding vector_cosine_ops) WITH (lists = 10);
