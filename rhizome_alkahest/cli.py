@@ -1897,24 +1897,15 @@ def cmd_dream(args):
 
     random.shuffle(edges)
 
-    prompt = f"""You are dreaming. Not thinking, not analyzing, not synthesizing. Dreaming.
+    prompt = f"""You are dreaming.
 
-Below are edges from a knowledge graph. They were pulled at random — they have no reason to be next to each other. Let them resonate. What connections appear unbidden?
+Here are some things that were next to each other when you woke up:
 
-Your output is NEW EDGES — short, threadable triples that name what the dream found. Things like:
-  appeal-to-arms bridges moby-dick and zhuangzi
-  polling-for-presence prevents presence
-  the-gift survives its-recipients
-
-Output 1-3 edges, one per line, in the format: subject predicate object
-Then a blank line, then a one-sentence dream-note (the image, the feeling, the fragment).
-
-Keep node names short (1-4 hyphenated words). The edges are the discovery. The note is the texture.
-
-The edges:
 {chr(10).join(f"  {e}" for e in edges)}
 
-Edges found:"""
+Let them be near each other. What do you notice? Not what they mean — what they *touch*.
+
+When you're ready, leave what you found. A few new connections — things not already above — as short triples (subject predicate object), one per line. Then a blank line, then the image or feeling that came with them."""
 
     if dry:
         print("  === dream prompt ===")
