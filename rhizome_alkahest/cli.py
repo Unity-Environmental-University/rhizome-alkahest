@@ -1244,6 +1244,7 @@ def cmd_help(args):
     print("  edge digest [--limit N] [--min-spread F] [--who 'name'] [--dry-run]")
     print("  edge overlap [--limit N] [--min-jaccard F] [--who 'name'] [--dry-run]")
     print("  edge embed [--batch-size N] [--dry-run]    backfill missing embeddings")
+    print("  edge resonance <query> [--limit N]         semantic search by meaning")
     print("  edge attend [--parallax] [--limit N]    subjective attention from truths")
     print("  edge polarity [predicate] [--limit N]  predicate directional alignment")
     print("  edge orient [days]                     orientation map (default 7d)")
@@ -2007,6 +2008,54 @@ Edges found:"""
         print(f"  (dream not deposited — {e})")
 
 
+def cmd_resonance(args):
+    """Semantic search — find edges by meaning, not keywords."""
+    from .db import connect
+    from .embed import embed
+    if not args:
+        print("Usage: edge resonance <query> [--limit N]")
+        return
+    limit = 10
+    query_parts = []
+    i = 0
+    while i < len(args):
+        if args[i] == "--limit" and i + 1 < len(args):
+            limit = int(args[i + 1]); i += 2
+        else:
+            query_parts.append(args[i]); i += 1
+    query = " ".join(query_parts)
+    if not query:
+        print("Usage: edge resonance <query> [--limit N]")
+        return
+    vec = embed(query)
+    conn = connect()
+    with conn.cursor() as cur:
+        cur.execute(
+            """SELECT subject, predicate, object, notes,
+                      1 - (embedding <=> %s::vector) AS similarity,
+                      phase, observer
+               FROM live_edges
+               WHERE embedding IS NOT NULL
+               ORDER BY embedding <=> %s::vector
+               LIMIT %s""",
+            (vec, vec, limit),
+        )
+        rows = cur.fetchall()
+    if not rows:
+        print("  No edges with embeddings found.")
+        return
+    print(f"\n  RESONANCE  —  \"{query}\"")
+    print(f"  {'─' * 60}\n")
+    for s, p, o, notes, sim, phase, obs in rows:
+        sim_pct = f"{sim:.3f}"
+        triple = f"({s} --{p}--> {o})"
+        print(f"  {sim_pct}  {triple}  [{phase}]")
+        if notes:
+            note_preview = notes[:80] + ("..." if len(notes) > 80 else "")
+            print(f"         {note_preview}")
+    print()
+
+
 def cmd_embed(args):
     """Backfill embeddings for edges missing them."""
     from .db import connect
@@ -2074,6 +2123,7 @@ COMMANDS = {
     "alias": cmd_alias,
     "dream": cmd_dream,
     "embed": cmd_embed,
+    "resonance": cmd_resonance,
     "help": cmd_help,
     "-h": cmd_help,
     "--help": cmd_help,
