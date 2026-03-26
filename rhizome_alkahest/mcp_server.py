@@ -694,6 +694,161 @@ def thread_new(slug: str, title: str = "") -> str:
 
 
 @mcp.tool()
+def edge_say(sentence: str, dry: bool = False) -> str:
+    """
+    Agglutinative edge creation. Write compressed sentences that expand into edges.
+
+    sentence: space-separated tokens in groups of three (subject predicate object).
+    Tokens may contain : and ~ suffixes:
+      : chains nodes — rooms:from:inhabitation → (rooms --from--> inhabitation)
+      ~ annotates edges — rooms~obs or rooms~because:inhabitation:drives:design
+
+    Grammar predicates come from the graph (predicates with >= 5 uses).
+    Aliases expand grammar (e.g. bc → because).
+
+    Example: edge_say("hallie builds rooms:from:inhabitation")
+    """
+    from .cli import _load_grammar, _expand_agglutination
+
+    args = sentence.split()
+    if len(args) < 3:
+        return "usage: edge_say('subject predicate object[:pred:val...]')"
+
+    conn = connect()
+    grammar, aliases = _load_grammar(conn)
+    conn.close()
+
+    triples = []
+    i = 0
+    while i + 2 < len(args):
+        triples.append((args[i], args[i + 1], args[i + 2]))
+        i += 3
+
+    if dry:
+        lines = [f"grammar ({len(grammar)}): {', '.join(sorted(grammar)[:20])}..."]
+        if aliases:
+            lines.append(f"aliases: {', '.join(f'{k}→{v}' for k, v in sorted(aliases.items()))}")
+        lines.append("")
+        for s, p, o in triples:
+            s_root, s_chains, s_anns = _expand_agglutination(s, grammar, aliases)
+            o_root, o_chains, o_anns = _expand_agglutination(o, grammar, aliases)
+            lines.append(f"({s_root} --{p}--> {o_root})")
+            for cp, co in o_chains:
+                lines.append(f"  : ({o_root} --{cp}--> {co})")
+            for ap, awords in o_anns:
+                if len(awords) >= 2:
+                    lines.append(f"  ~ e:... --{ap}--> e:{awords[0]}/.../{awords[-1]}")
+                elif awords:
+                    lines.append(f"  ~ e:... --{ap}--> {awords[0]}")
+                else:
+                    lines.append(f"  ~{ap}")
+        return "\n".join(lines)
+
+    frame = _load_frame()
+    if not frame:
+        return "No frame. Call edge_iam first."
+    if not frame.ready:
+        return f"Frame incomplete ({len(frame.truths)}/3 truths). Call edge_true."
+
+    g = Graph(frame)
+    lines = []
+
+    for s_raw, p, o_raw in triples:
+        s_root, s_chains, s_anns = _expand_agglutination(s_raw, grammar, aliases)
+        o_root, o_chains, o_anns = _expand_agglutination(o_raw, grammar, aliases)
+
+        if s_root.startswith("e[") and s_root.endswith("]"):
+            inner = s_root[2:-1]
+            parts = inner.split()
+            if len(parts) == 3:
+                ref = g.resolve_triple(parts[0], parts[1], parts[2])
+                if ref is None:
+                    return f"error: no live edge matching ({parts[0]} --{parts[1]}--> {parts[2]})"
+            else:
+                ref = g.resolve_slug(inner)
+                if ref is None:
+                    return f"error: no live edge with slug/hash '{inner}'"
+            s_root = f"e:{ref.subject}/{ref.predicate}/{ref.object}"
+
+        base = g.add(s_root, p, o_root)
+        lines.append(f"+ {_fmt_edge(base)}  #{base.hash}")
+
+        chain_prev = o_root
+        for cp, co in o_chains:
+            chain_edge = g.add(chain_prev, cp, co)
+            lines.append(f"  : {_fmt_edge(chain_edge)}  #{chain_edge.hash}")
+            chain_prev = co
+
+        base_ref = f"e:{base.subject}/{base.predicate}/{base.object}"
+        for ap, awords in o_anns:
+            if len(awords) >= 3:
+                ann_s, ann_p, ann_o = awords[0], awords[1], awords[2]
+                ann_edge = g.add(ann_s, ann_p, ann_o)
+                ann_ref = f"e:{ann_edge.subject}/{ann_edge.predicate}/{ann_edge.object}"
+                link = g.add(base_ref, ap, ann_ref)
+                lines.append(f"  ~ {_fmt_edge(ann_edge)}  #{ann_edge.hash}")
+                lines.append(f"    {ap} → #{link.hash}")
+            elif len(awords) == 1:
+                link = g.add(base_ref, ap, awords[0])
+                lines.append(f"  ~ ({base_ref} --{ap}--> {awords[0]})  #{link.hash}")
+            elif len(awords) == 0:
+                link = g.add(base_ref, "evidentiality", ap)
+                lines.append(f"  ~ ({base_ref} --evidentiality--> {ap})  #{link.hash}")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def edge_alias(abbreviation: str = "", predicate: str = "", remove: bool = False) -> str:
+    """
+    Create, list, or remove predicate aliases for edge_say grammar.
+
+    List all: edge_alias()
+    Create:  edge_alias("bc", "because")
+    Remove:  edge_alias("bc", remove=True)
+    """
+    if not abbreviation:
+        conn = connect()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT subject, object FROM live_edges
+                WHERE predicate = 'is-alias-for'
+                ORDER BY subject
+            """)
+            rows = cur.fetchall()
+        conn.close()
+        if not rows:
+            return "no aliases. create with: edge_alias('short', 'predicate')"
+        return "\n".join(f"{abbrev} → {full}" for abbrev, full in rows)
+
+    if remove:
+        conn = connect()
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE edges SET dissolved_at = now()
+                WHERE subject = %s AND predicate = 'is-alias-for' AND dissolved_at IS NULL
+                RETURNING object
+            """, (abbreviation,))
+            row = cur.fetchone()
+        conn.commit()
+        conn.close()
+        if row:
+            return f"removed: {abbreviation} → {row[0]}"
+        return f"no alias '{abbreviation}' found"
+
+    if not predicate:
+        return "usage: edge_alias('abbreviation', 'predicate')"
+
+    frame = _load_frame()
+    if not frame or not frame.ready:
+        return "No active frame. Call edge_iam + edge_true (x3) first."
+
+    g = Graph(frame)
+    edge = g.add(abbreviation, "is-alias-for", predicate, confidence=1.0, phase="salt")
+    return f"+ {_fmt_edge(edge)}  #{edge.hash}\n  {abbreviation} → {predicate}"
+
+
+@mcp.tool()
 def edge_garden(limit: int = 20) -> str:
     """Surface edges that need tending: long terms, unnamed salt, etc."""
     conn = connect()
