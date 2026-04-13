@@ -9,22 +9,31 @@ import sys
 from .db import connect
 from .frame_pointer import read_token
 from .graph import Graph
-from .cli_helpers import require_frame
+from .cli_helpers import require_frame, load_edgeignore, edgeignore_sql
 
 
 def cmd_find(args):
+    show_all = "--all" in args
+    args = [a for a in args if a != "--all"]
     if not args:
         print("usage: edge find <term>")
         sys.exit(1)
     conn = connect()
     with conn.cursor() as cur:
         term = args[0]
-        cur.execute("""
+        query = """
             SELECT e.subject, e.predicate, e.object, e.confidence, e.phase, f.who
             FROM live_edges e JOIN frames f ON e.observer = f.token
-            WHERE e.subject ILIKE %s OR e.predicate ILIKE %s OR e.object ILIKE %s
-            ORDER BY e.confidence DESC
-        """, (f"%{term}%", f"%{term}%", f"%{term}%"))
+            WHERE (e.subject ILIKE %s OR e.predicate ILIKE %s OR e.object ILIKE %s)
+        """
+        params = [f"%{term}%", f"%{term}%", f"%{term}%"]
+        if not show_all:
+            ignore_clause, ignore_params = edgeignore_sql(load_edgeignore())
+            if ignore_clause:
+                query += " AND " + ignore_clause
+                params.extend(ignore_params)
+        query += " ORDER BY e.confidence DESC"
+        cur.execute(query, params)
         rows = cur.fetchall()
     conn.close()
     if not rows:
@@ -169,21 +178,32 @@ def cmd_whoami(args):
 
 
 def cmd_ls(args):
+    show_all = "--all" in args
+    args = [a for a in args if a != "--all"]
     phase = args[0] if args else None
     conn = connect()
     with conn.cursor() as cur:
         if phase:
-            cur.execute("""
+            query = """
                 SELECT e.subject, e.predicate, e.object, e.confidence, f.who
                 FROM live_edges e JOIN frames f ON e.observer = f.token
-                WHERE e.phase = %s ORDER BY e.updated_at DESC
-            """, (phase,))
+                WHERE e.phase = %s
+            """
+            params = [phase]
         else:
-            cur.execute("""
+            query = """
                 SELECT e.subject, e.predicate, e.object, e.confidence, e.phase, f.who
                 FROM live_edges e JOIN frames f ON e.observer = f.token
-                ORDER BY e.updated_at DESC
-            """)
+                WHERE 1=1
+            """
+            params = []
+        if not show_all:
+            ignore_clause, ignore_params = edgeignore_sql(load_edgeignore())
+            if ignore_clause:
+                query += " AND " + ignore_clause
+                params.extend(ignore_params)
+        query += " ORDER BY e.updated_at DESC"
+        cur.execute(query, params)
         rows = cur.fetchall()
     conn.close()
     for row in rows:
@@ -206,23 +226,48 @@ def cmd_dissolve(args):
 
 
 def cmd_count(args):
+    show_all = "--all" in args
     conn = connect()
     with conn.cursor() as cur:
-        cur.execute("SELECT * FROM phase_summary;")
+        ignore_clause, ignore_params = "", []
+        if not show_all:
+            ignore_clause, ignore_params = edgeignore_sql(load_edgeignore())
+
+        if ignore_clause:
+            cur.execute("""
+                SELECT e.phase, count(*), avg(e.confidence)
+                FROM live_edges e
+                WHERE """ + ignore_clause + """
+                GROUP BY e.phase ORDER BY count(*) DESC
+            """, ignore_params)
+        else:
+            cur.execute("SELECT * FROM phase_summary;")
         print("  Phase summary:")
         for phase, n, avg_c in cur.fetchall():
             print(f"    {phase}: {n} edges, avg confidence {avg_c:.2f}")
 
-        cur.execute("""
-            SELECT f.who, count(*) as n
-            FROM live_edges e JOIN frames f ON e.observer = f.token
-            GROUP BY f.who ORDER BY n DESC
-        """)
+        if ignore_clause:
+            cur.execute("""
+                SELECT f.who, count(*) as n
+                FROM live_edges e JOIN frames f ON e.observer = f.token
+                WHERE """ + ignore_clause + """
+                GROUP BY f.who ORDER BY n DESC
+            """, ignore_params)
+        else:
+            cur.execute("""
+                SELECT f.who, count(*) as n
+                FROM live_edges e JOIN frames f ON e.observer = f.token
+                GROUP BY f.who ORDER BY n DESC
+            """)
         print("  By observer:")
         for who, n in cur.fetchall():
             print(f"    {who}: {n}")
 
-        cur.execute("SELECT count(*) FROM live_edges")
+        if ignore_clause:
+            cur.execute("SELECT count(*) FROM live_edges e WHERE " + ignore_clause, ignore_params)
+        else:
+            cur.execute("SELECT count(*) FROM live_edges")
         total = cur.fetchone()[0]
-        print(f"  Total: {total}")
+        label = "Total" if show_all else "Total (filtered)"
+        print(f"  {label}: {total}")
     conn.close()

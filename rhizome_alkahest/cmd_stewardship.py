@@ -9,7 +9,7 @@ import sys
 from .db import connect
 from .edge import Edge
 from .graph import Graph
-from .cli_helpers import require_frame, fmt_edge
+from .cli_helpers import require_frame, fmt_edge, load_edgeignore, edgeignore_sql
 
 
 def cmd_garden(args):
@@ -22,14 +22,19 @@ def cmd_garden(args):
     limit = 20
     do_pace = "--pace" in args
     do_fluid_ratio = "--fluid-ratio" in args
+    show_all = "--all" in args
     i = 0
     while i < len(args):
         if args[i] == "--limit" and i + 1 < len(args):
             limit = int(args[i + 1]); i += 2
-        elif args[i] in ("--pace", "--fluid-ratio"):
+        elif args[i] in ("--pace", "--fluid-ratio", "--all"):
             i += 1
         else:
             i += 1
+
+    ignore_clause, ignore_params = "", []
+    if not show_all:
+        ignore_clause, ignore_params = edgeignore_sql(load_edgeignore())
 
     conn = connect()
     with conn.cursor() as cur:
@@ -101,7 +106,7 @@ def cmd_garden(args):
                 return
 
         # Long edges — subject or object over 50 chars, excluding already-decomposed
-        cur.execute("""
+        long_query = """
             SELECT e.id, e.subject, e.predicate, e.object, e.confidence, e.phase, f.who, e.hash, e.slug
             FROM live_edges e JOIN frames f ON e.observer = f.token
             WHERE (length(e.subject) > 50 OR length(e.object) > 50)
@@ -110,20 +115,28 @@ def cmd_garden(args):
                 WHERE d.predicate = 'decomposed-into'
                 AND d.subject = 'e:' || e.subject || '/' || e.predicate || '/' || e.object
             )
-            ORDER BY greatest(length(e.subject), length(e.object)) DESC
-            LIMIT %s
-        """, (limit,))
+        """
+        long_params = list(ignore_params)
+        if ignore_clause:
+            long_query += " AND " + ignore_clause
+        long_query += " ORDER BY greatest(length(e.subject), length(e.object)) DESC LIMIT %s"
+        long_params.append(limit)
+        cur.execute(long_query, long_params)
         long_edges = cur.fetchall()
 
         # Salt edges without slugs (high-value, unnamed)
-        cur.execute("""
+        salt_query = """
             SELECT e.id, e.subject, e.predicate, e.object, e.confidence, e.phase, f.who, e.hash, e.slug
             FROM live_edges e JOIN frames f ON e.observer = f.token
             WHERE e.phase = 'salt' AND e.slug IS NULL
             AND e.predicate NOT IN ('speaks-as', 'speaks-for')
-            ORDER BY e.confidence DESC
-            LIMIT %s
-        """, (limit,))
+        """
+        salt_params = list(ignore_params)
+        if ignore_clause:
+            salt_query += " AND " + ignore_clause
+        salt_query += " ORDER BY e.confidence DESC LIMIT %s"
+        salt_params.append(limit)
+        cur.execute(salt_query, salt_params)
         unnamed_salt = cur.fetchall()
 
     conn.close()

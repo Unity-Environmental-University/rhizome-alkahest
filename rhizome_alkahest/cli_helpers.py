@@ -4,11 +4,52 @@ These are the common utilities that multiple command files need:
 frame loading, edge formatting, etc.
 """
 
+import os
 import sys
 
 from .db import connect
 from .frame import Frame
 from .frame_pointer import read_token
+
+
+def load_edgeignore():
+    """Load .edgeignore patterns from the repo root.
+
+    Returns a list of prefix strings (patterns like 'go9:*' become 'go9:').
+    Only glob-style prefix patterns (ending in *) are supported.
+    """
+    # Walk up from this file to find .edgeignore
+    d = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    path = os.path.join(d, ".edgeignore")
+    if not os.path.exists(path):
+        return []
+    prefixes = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.endswith("*"):
+                prefixes.append(line[:-1])
+            else:
+                prefixes.append(line)
+    return prefixes
+
+
+def edgeignore_sql(prefixes, column="e.subject"):
+    """Return a SQL WHERE clause fragment that excludes ignored prefixes.
+
+    Returns (clause_str, params_list). The clause uses AND so it can be
+    appended to an existing WHERE. Returns ('', []) if no patterns.
+    """
+    if not prefixes:
+        return "", []
+    clauses = []
+    params = []
+    for prefix in prefixes:
+        clauses.append(f"{column} NOT LIKE %s")
+        params.append(prefix + "%")
+    return " AND ".join(clauses), params
 
 
 def load_frame(conn=None):
