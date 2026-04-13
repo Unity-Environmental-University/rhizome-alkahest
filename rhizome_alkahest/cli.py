@@ -1255,6 +1255,8 @@ def cmd_help(args):
     print("  edge words [--limit N]                 vocabulary frequency across the graph")
     print("  edge say <sentence...>                 polysynthetic: graph predicates become grammar")
     print("  edge say --dry                         parse only, don't record")
+    print("  edge gc [--days N] [--predicate P] [--dry] [--all-volatile]")
+    print("                                         dissolve stale volatile edges (default 14d)")
 
 
 # ---------------------------------------------------------------------------
@@ -2097,6 +2099,72 @@ def cmd_embed(args):
 
 
 # ---------------------------------------------------------------------------
+# Stewardship — gc (garbage collect volatile edges)
+# ---------------------------------------------------------------------------
+
+def cmd_gc(args):
+    """Dissolve stale volatile edges.
+
+    --days N: older than N days (default 14)
+    --predicate P: only dissolve edges with this predicate (e.g. dreamt-on)
+    --dry: show what would be dissolved without doing it
+    --all-volatile: dissolve all volatile regardless of age (still respects --predicate)
+    """
+    days = 14
+    predicate = None
+    dry = "--dry" in args
+    all_volatile = "--all-volatile" in args
+    i = 0
+    while i < len(args):
+        if args[i] == "--days" and i + 1 < len(args):
+            days = int(args[i + 1]); i += 2
+        elif args[i] == "--predicate" and i + 1 < len(args):
+            predicate = args[i + 1]; i += 2
+        elif args[i] in ("--dry", "--all-volatile"):
+            i += 1
+        else:
+            i += 1
+
+    conn = connect()
+    with conn.cursor() as cur:
+        # Count first
+        where = "phase = 'volatile' AND dissolved_at IS NULL"
+        params = []
+        if not all_volatile:
+            where += " AND created_at < now() - interval '%s days'"
+            params.append(days)
+        if predicate:
+            where += " AND predicate = %s"
+            params.append(predicate)
+
+        cur.execute(f"SELECT count(*) FROM edges WHERE {where}", params)
+        count = cur.fetchone()[0]
+
+        if count == 0:
+            print("  nothing to collect")
+            return
+
+        if dry:
+            # Show a sample
+            cur.execute(
+                f"""SELECT subject, predicate, object, created_at::date
+                    FROM edges WHERE {where}
+                    ORDER BY created_at ASC LIMIT 20""",
+                params,
+            )
+            print(f"  would dissolve {count} volatile edge(s):")
+            for s, p, o, d in cur.fetchall():
+                print(f"    ({s} --{p}--> {o}) [{d}]")
+            if count > 20:
+                print(f"    ... and {count - 20} more")
+            return
+
+        cur.execute(f"UPDATE edges SET dissolved_at = now() WHERE {where}", params)
+        conn.commit()
+        print(f"  dissolved {count} volatile edge(s)")
+
+
+# ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
 
@@ -2129,6 +2197,7 @@ COMMANDS = {
     "say": cmd_say,
     "alias": cmd_alias,
     "dream": cmd_dream,
+    "gc": cmd_gc,
     "embed": cmd_embed,
     "resonance": cmd_resonance,
     "help": cmd_help,
