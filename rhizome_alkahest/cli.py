@@ -6,7 +6,8 @@ Usage: python -m rhizome_alkahest.cli <command> [args...]
 
 import sys
 
-from .cmd_stewardship import cmd_garden, cmd_name, cmd_words, cmd_gc, cmd_decompose
+from .cmd_stewardship import cmd_garden, cmd_name, cmd_words, cmd_gc, cmd_decompose, cmd_promote
+from .daemon import cmd_pulse
 from .cmd_query import (cmd_find, cmd_about, cmd_from, cmd_parallax,
                         cmd_parallax_token, cmd_frames, cmd_whoami,
                         cmd_ls, cmd_dissolve, cmd_count)
@@ -53,6 +54,8 @@ COMMANDS = {
     "alias": cmd_alias,
     "dream": cmd_dream,
     "gc": cmd_gc,
+    "promote": cmd_promote,
+    "pulse": cmd_pulse,
     "embed": cmd_embed,
     "resonance": cmd_resonance,
     "help": cmd_help,

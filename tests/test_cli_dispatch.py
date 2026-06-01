@@ -15,8 +15,8 @@ def test_all_commands_are_callable():
 
 def test_command_count_is_tracked():
     """Bump this number when commands are added or removed."""
-    assert len(COMMANDS) == 34, (
-        f"Command count changed: expected 34, got {len(COMMANDS)}. "
+    assert len(COMMANDS) == 36, (
+        f"Command count changed: expected 36, got {len(COMMANDS)}. "
         f"Update this test to match."
     )
 

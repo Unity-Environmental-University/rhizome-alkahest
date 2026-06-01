@@ -301,21 +301,36 @@ def cmd_gc(args):
     --predicate P: only dissolve edges with this predicate (e.g. dreamt-on)
     --dry: show what would be dissolved without doing it
     --all-volatile: dissolve all volatile regardless of age (still respects --predicate)
+    --amnesty: backlog-safe mode. Dissolve ONLY dream-spawned volatiles
+        (those with a dreamt-on provenance edge), and NEVER dissolve a
+        load-bearing volatile (one referenced as subject/object by another
+        live edge). Use this when decay hasn't run for a long time: the
+        backlog is mostly lived session memory, not slop, and a blind
+        age-sweep would be demolition, not decay. Lived observations are
+        left for a deliberate human/Claude tend pass.
+
+    Load-bearing volatiles are NEVER dissolved, in any mode — dissolving
+    them would orphan the edges that point at them.
     """
     days = 14
     predicate = None
     dry = "--dry" in args
     all_volatile = "--all-volatile" in args
+    amnesty = "--amnesty" in args
     i = 0
     while i < len(args):
         if args[i] == "--days" and i + 1 < len(args):
             days = int(args[i + 1]); i += 2
         elif args[i] == "--predicate" and i + 1 < len(args):
             predicate = args[i + 1]; i += 2
-        elif args[i] in ("--dry", "--all-volatile"):
+        elif args[i] in ("--dry", "--all-volatile", "--amnesty"):
             i += 1
         else:
             i += 1
+
+    # Amnesty implies dream-only unless the caller named a different predicate.
+    if amnesty and predicate is None:
+        predicate = "__dream_spawned__"  # sentinel; expanded in WHERE below
 
     conn = connect()
     with conn.cursor() as cur:
@@ -325,9 +340,33 @@ def cmd_gc(args):
         if not all_volatile:
             where += " AND created_at < now() - interval '%s days'"
             params.append(days)
-        if predicate:
+        if predicate == "__dream_spawned__":
+            # Only volatiles that a dream produced (have a dreamt-on edge
+            # pointing at their edge-as-subject form).
+            where += (
+                " AND EXISTS (SELECT 1 FROM edges d"
+                " WHERE d.subject = 'e:' || edges.subject || '/' || edges.predicate"
+                " || '/' || edges.object AND d.predicate = 'dreamt-on')"
+            )
+        elif predicate:
             where += " AND predicate = %s"
             params.append(predicate)
+
+        # NEVER dissolve a load-bearing volatile — one referenced as the
+        # subject or object of another live edge. Applies in every mode.
+        # Exclude pure provenance/bookkeeping predicates from "load-bearing":
+        # a dream edge's own `dreamt-on` link points AT it, but that's its
+        # birth certificate, not a dependency — it must not immunize the edge
+        # against its own gc. Only *semantic* references count as load-bearing.
+        where += (
+            " AND NOT EXISTS (SELECT 1 FROM live_edges r"
+            " WHERE r.predicate NOT IN ('dreamt-on', 'decomposed-into',"
+            "   'compressed-to', 'records', 'dreamt-on')"
+            " AND (r.subject = 'e:' || edges.subject || '/' || edges.predicate"
+            "        || '/' || edges.object"
+            "   OR r.object = 'e:' || edges.subject || '/' || edges.predicate"
+            "        || '/' || edges.object))"
+        )
 
         cur.execute(f"SELECT count(*) FROM edges WHERE {where}", params)
         count = cur.fetchone()[0]
@@ -354,3 +393,72 @@ def cmd_gc(args):
         cur.execute(f"UPDATE edges SET dissolved_at = now() WHERE {where}", params)
         conn.commit()
         print(f"  dissolved {count} volatile edge(s)")
+
+
+def cmd_promote(args):
+    """Promote corroborated volatile edges to fluid.
+
+    A volatile triple seen by K or more *distinct observers* has been
+    independently confirmed — it has earned persistence. This is the
+    counterweight to gc: gc dissolves what nothing confirmed, promote
+    keeps what something did. Together they are the metabolism that
+    keeps volatiles from accumulating silently (task #312).
+
+    Promotion never merges and never deletes — it only lifts phase on
+    the corroborated copies, so parallax is preserved. The confidence
+    of each promoted edge is nudged up (capped below 1.0) per the
+    accumulate-never-reach-1.0 rule.
+
+    --observers K: distinct observers required (default 2)
+    --dry: show what would be promoted without doing it
+    """
+    min_obs = 2
+    dry = "--dry" in args
+    i = 0
+    while i < len(args):
+        if args[i] == "--observers" and i + 1 < len(args):
+            min_obs = int(args[i + 1]); i += 2
+        elif args[i] == "--dry":
+            i += 1
+        else:
+            i += 1
+
+    conn = connect()
+    with conn.cursor() as cur:
+        # Triples that are volatile and corroborated by >= K distinct observers.
+        cur.execute(
+            """SELECT subject, predicate, object, count(DISTINCT observer) AS obs
+               FROM live_edges
+               WHERE phase = 'volatile'
+               GROUP BY subject, predicate, object
+               HAVING count(DISTINCT observer) >= %s
+               ORDER BY obs DESC""",
+            (min_obs,),
+        )
+        candidates = cur.fetchall()
+
+        if not candidates:
+            print(f"  no volatile triples corroborated by >= {min_obs} observers")
+            return
+
+        if dry:
+            print(f"  would promote {len(candidates)} corroborated triple(s) to fluid:")
+            for s, p, o, obs in candidates:
+                print(f"    ({s} --{p}--> {o})  [{obs} observers]")
+            return
+
+        promoted = 0
+        for s, p, o, obs in candidates:
+            cur.execute(
+                """UPDATE edges
+                   SET phase = 'fluid',
+                       confidence = LEAST(confidence + 0.1, 0.95),
+                       updated_at = now()
+                   WHERE subject = %s AND predicate = %s AND object = %s
+                   AND phase = 'volatile' AND dissolved_at IS NULL""",
+                (s, p, o),
+            )
+            promoted += cur.rowcount
+            print(f"  ↑ ({s} --{p}--> {o})  [{obs} observers] → fluid")
+        conn.commit()
+        print(f"  promoted {promoted} edge(s) across {len(candidates)} corroborated triple(s)")
